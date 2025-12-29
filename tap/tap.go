@@ -1,6 +1,7 @@
+//go:build linux
+
 // Copyright (c) Tailscale Inc & AUTHORS
 // SPDX-License-Identifier: BSD-3-Clause
-
 // Package tap registers Tailscale's experimental (demo) Linux TAP (Layer 2) support.
 package tap
 
