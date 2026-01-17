@@ -153,10 +153,10 @@ import (
 	"time"
 
 	"golang.org/x/sync/errgroup"
-	"pkg.maisem.dev/deferr"
-	"pkg.maisem.dev/safeid"
 	"modernc.org/sqlite"
 	sqliteh "modernc.org/sqlite/lib"
+	"pkg.maisem.dev/deferr"
+	"pkg.maisem.dev/safeid"
 	"tailscale.com/metrics"
 	"tailscale.com/syncs"
 	"tailscale.com/types/logger"
@@ -435,18 +435,19 @@ func (db *DB) ReadTxWithWhy(ctx context.Context, why string) (_ *Tx, err error) 
 	if !ok {
 		panic("tx tracker not found in context")
 	}
-	var release deferr.ErrCloser
+	var release deferr.Closers
 	defer release.CloseOnErr(&err)
 
-	release.Add(tracker.Track(why))
+	release.Add(func() error { tracker.Track(why)(); return nil })
 	var now time.Time
 	if fn, ok := UTCNowKey.ValueOk(ctx); ok {
 		now = fn()
 	} else {
 		now = db.timeNowUTC()
 	}
-	release.Add(func() {
+	release.Add(func() error {
 		metricRxDurationNanoseconds.Add(why, db.timeNowUTC().Sub(now).Nanoseconds())
+		return nil
 	})
 	stx, err := db.ro.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 	if err != nil {
@@ -498,15 +499,15 @@ func (db *DB) Tx(ctx context.Context, why string) (_ *Tx, err error) {
 	if !ok {
 		panic("tx tracker not found in context")
 	}
-	var release deferr.ErrCloser
+	var release deferr.Closers
 	defer release.CloseOnErr(&err)
 
-	release.Add(tracker.Track(why))
+	release.Add(func() error { tracker.Track(why)(); return nil })
 	releaseOnce, err := db.acquireWriteLock(ctx)
 	if err != nil {
 		return nil, err
 	}
-	release.Add(releaseOnce)
+	release.Add(func() error { releaseOnce(); return nil })
 	stx, err := db.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
 	if err != nil {
 		return nil, err
@@ -517,8 +518,9 @@ func (db *DB) Tx(ctx context.Context, why string) (_ *Tx, err error) {
 	} else {
 		now = db.timeNowUTC()
 	}
-	release.Add(func() {
+	release.Add(func() error {
 		metricTxDurationNanoseconds.Add(why, db.timeNowUTC().Sub(now).Nanoseconds())
+		return nil
 	})
 	return &Tx{ctx: ctx, stx: stx, db: db, release: &release, utcNow: now}, nil
 }
@@ -587,7 +589,7 @@ type Tx struct {
 	onCommitCallbacks   []func()
 	onRollbackCallbacks []func()
 
-	release *deferr.ErrCloser
+	release *deferr.Closers
 }
 
 // UTCNow returns the time at which the Tx was created.
@@ -1041,7 +1043,7 @@ func (tx *Tx) ExecAndReturnRowsAffected(query queryString, args ...any) (int64, 
 // with generated IDs until successful or max attempts reached.
 func CreateWithSafeID[T any, ID ~int64](create func(id ID) (T, error)) (T, error) {
 	var zero T
-	for attempt := 0; attempt < 100; attempt++ {
+	for attempt := range 100 {
 		id := safeid.New[ID](attempt)
 		t, err := create(id)
 		if err != nil {
