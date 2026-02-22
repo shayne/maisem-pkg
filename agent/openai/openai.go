@@ -16,7 +16,6 @@ import (
 	"github.com/openai/openai-go/option"
 	"github.com/openai/openai-go/shared"
 	"pkg.maisem.dev/agent"
-	"pkg.maisem.dev/agent/models"
 )
 
 // Client wraps the OpenAI client to implement agent.LLMClient
@@ -214,11 +213,10 @@ func (c *Client) buildChatCompletionParams(req agent.MessagesRequest) openai.Cha
 
 	// Set max tokens if specified
 	if req.MaxTokens > 0 {
-		switch c.model {
-		case models.O3Latest, models.GPT5:
-			// Parameter changed in OpenAI API
+		if usesMaxCompletionTokens(c.model) {
+			// Parameter changed in OpenAI API for GPT-5 and reasoning models.
 			params.MaxCompletionTokens = openai.Int(int64(req.MaxTokens))
-		default:
+		} else {
 			params.MaxTokens = openai.Int(int64(req.MaxTokens))
 		}
 	}
@@ -273,6 +271,11 @@ func (c *Client) buildChatCompletionParams(req agent.MessagesRequest) openai.Cha
 	}
 
 	return params
+}
+
+func usesMaxCompletionTokens(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(m, "gpt-5") || strings.HasPrefix(m, "o3")
 }
 
 // convertMessage converts agent message to OpenAI format
