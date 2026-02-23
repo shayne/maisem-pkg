@@ -136,3 +136,12 @@ func TestCollectAndBuildToolUseContents_AccumulatesArgumentsAcrossChunks(t *test
 		t.Fatalf("expected merged args to include reminder_at, got %q", string(got.ToolUse.Input))
 	}
 }
+
+func TestUsesResponsesAPI_CodexModels(t *testing.T) {
+	if !usesResponsesAPI("gpt-5.3-codex") {
+		t.Fatalf("expected codex model to use responses API")
+	}
+	if usesResponsesAPI("gpt-5.2") {
+		t.Fatalf("expected non-codex model to use chat completions API")
+	}
+}

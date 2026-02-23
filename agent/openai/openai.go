@@ -15,6 +15,7 @@ import (
 
 	"github.com/openai/openai-go"
 	"github.com/openai/openai-go/option"
+	"github.com/openai/openai-go/responses"
 	"github.com/openai/openai-go/shared"
 	"pkg.maisem.dev/agent"
 )
@@ -87,6 +88,10 @@ func (c *Client) CountTokens(ctx context.Context, req agent.MessagesRequest) (in
 
 func (c *Client) CreateMessages(ctx context.Context, req agent.MessagesRequest, onUpdate func(agent.MessagesResponse)) (agent.MessagesResponse, error) {
 	_ = onUpdate
+
+	if usesResponsesAPI(c.model) {
+		return c.createMessagesWithResponses(ctx, req)
+	}
 
 	// Convert our request to OpenAI request
 	params := c.buildChatCompletionParams(req)
@@ -200,6 +205,241 @@ func (c *Client) CreateMessages(ctx context.Context, req agent.MessagesRequest, 
 	}
 
 	return response, nil
+}
+
+func (c *Client) createMessagesWithResponses(ctx context.Context, req agent.MessagesRequest) (agent.MessagesResponse, error) {
+	params := c.buildResponsesParams(req)
+
+	start := time.Now()
+	resp, err := c.client.Responses.New(ctx, params)
+	if err != nil {
+		return agent.MessagesResponse{}, c.handleError(err)
+	}
+	responseTime := time.Since(start)
+
+	if resp.Status == "incomplete" && resp.IncompleteDetails.Reason == "max_output_tokens" {
+		return agent.MessagesResponse{}, fmt.Errorf("%w: %s", agent.ErrTooLarge, resp.IncompleteDetails.Reason)
+	}
+
+	collectedContent := responseOutputToContent(resp.Output)
+	responseUsage := agent.Usage{
+		InputTokens:  int(resp.Usage.InputTokens),
+		OutputTokens: int(resp.Usage.OutputTokens),
+	}
+	if resp.Usage.InputTokensDetails.CachedTokens != 0 {
+		responseUsage.CacheReadInputTokens = int(resp.Usage.InputTokensDetails.CachedTokens)
+	}
+
+	if responseUsage.InputTokens == 0 && responseUsage.OutputTokens == 0 {
+		if inputTokens, countErr := c.CountTokens(ctx, req); countErr == nil {
+			responseUsage.InputTokens = inputTokens
+		}
+		outputChars := 0
+		for _, content := range collectedContent {
+			if content.Type == agent.ContentTypeText {
+				outputChars += len(content.Text)
+			} else if content.Type == agent.ContentTypeToolUse && content.ToolUse != nil {
+				outputChars += len(content.ToolUse.Name) + len(content.ToolUse.Input)
+			}
+		}
+		responseUsage.OutputTokens = outputChars / 4
+	}
+
+	stopReason := "end_turn"
+	for _, content := range collectedContent {
+		if content.Type == agent.ContentTypeToolUse {
+			stopReason = "tool_use"
+			break
+		}
+	}
+
+	return agent.MessagesResponse{
+		ID:               resp.ID,
+		StopReason:       stopReason,
+		Content:          collectedContent,
+		TimeToFirstToken: responseTime, // Responses API non-streaming call does not expose TTFT.
+		ResponseTime:     responseTime,
+		Usage:            responseUsage,
+	}, nil
+}
+
+func (c *Client) buildResponsesParams(req agent.MessagesRequest) responses.ResponseNewParams {
+	params := responses.ResponseNewParams{
+		Model: shared.ResponsesModel(c.model),
+	}
+
+	if req.System != "" {
+		params.Instructions = openai.String(req.System)
+	}
+	if req.MaxTokens > 0 {
+		params.MaxOutputTokens = openai.Int(int64(req.MaxTokens))
+	}
+
+	input := convertToResponsesInput(req.Messages)
+	if len(input) > 0 {
+		params.Input = responses.ResponseNewParamsInputUnion{
+			OfInputItemList: input,
+		}
+	}
+
+	if len(req.Tools) > 0 {
+		params.Tools = make([]responses.ToolUnionParam, 0, len(req.Tools))
+		for _, t := range req.Tools {
+			var schema map[string]any
+			if err := json.Unmarshal(t.InputSchema, &schema); err != nil {
+				continue
+			}
+			params.Tools = append(params.Tools, responses.ToolUnionParam{
+				OfFunction: &responses.FunctionToolParam{
+					Name:        t.Name,
+					Description: openai.String(t.Description),
+					Parameters:  schema,
+					Strict:      openai.Bool(true),
+				},
+			})
+		}
+	}
+
+	if req.ToolChoice != nil {
+		switch req.ToolChoice.Type {
+		case "tool":
+			params.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
+				OfFunctionTool: &responses.ToolChoiceFunctionParam{
+					Name: req.ToolChoice.Name,
+				},
+			}
+		case "any":
+			params.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
+				OfToolChoiceMode: openai.Opt(responses.ToolChoiceOptionsRequired),
+			}
+		default:
+			params.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
+				OfToolChoiceMode: openai.Opt(responses.ToolChoiceOptionsAuto),
+			}
+		}
+	}
+
+	return params
+}
+
+func convertToResponsesInput(messages []agent.Message) responses.ResponseInputParam {
+	var out responses.ResponseInputParam
+
+	for _, m := range messages {
+		switch m.Role {
+		case agent.RoleTool:
+			for _, c := range m.Content {
+				if c.Type != agent.ContentTypeToolResult || c.ToolResults == nil {
+					continue
+				}
+				out = append(out, responses.ResponseInputItemParamOfFunctionCallOutput(
+					c.ToolResults.ToolCallID,
+					c.ToolResults.Output,
+				))
+			}
+		case agent.RoleAssistant:
+			out = append(out, assistantMessageToResponsesItems(m.Content)...)
+		case agent.RoleSystem:
+			parts := contentToResponsesParts(m.Content)
+			if len(parts) == 0 {
+				continue
+			}
+			out = append(out, responses.ResponseInputItemParamOfMessage(parts, responses.EasyInputMessageRoleSystem))
+		default:
+			parts := contentToResponsesParts(m.Content)
+			if len(parts) == 0 {
+				continue
+			}
+			out = append(out, responses.ResponseInputItemParamOfMessage(parts, responses.EasyInputMessageRoleUser))
+		}
+	}
+
+	return out
+}
+
+func assistantMessageToResponsesItems(content agent.Content) []responses.ResponseInputItemUnionParam {
+	var out []responses.ResponseInputItemUnionParam
+	var textParts responses.ResponseInputMessageContentListParam
+
+	flushText := func() {
+		if len(textParts) == 0 {
+			return
+		}
+		out = append(out, responses.ResponseInputItemParamOfMessage(textParts, responses.EasyInputMessageRoleAssistant))
+		textParts = nil
+	}
+
+	for _, c := range content {
+		switch c.Type {
+		case agent.ContentTypeText:
+			textParts = append(textParts, responses.ResponseInputContentParamOfInputText(c.Text))
+		case agent.ContentTypeToolUse:
+			if c.ToolUse == nil {
+				continue
+			}
+			flushText()
+			callID := c.ToolUse.ID
+			if callID == "" {
+				callID = fmt.Sprintf("call_%d", len(out)+1)
+			}
+			out = append(out, responses.ResponseInputItemParamOfFunctionCall(
+				string(normalizeToolCallArguments(string(c.ToolUse.Input))),
+				callID,
+				c.ToolUse.Name,
+			))
+		}
+	}
+
+	flushText()
+	return out
+}
+
+func contentToResponsesParts(content agent.Content) responses.ResponseInputMessageContentListParam {
+	var parts responses.ResponseInputMessageContentListParam
+	for _, c := range content {
+		switch c.Type {
+		case agent.ContentTypeText:
+			parts = append(parts, responses.ResponseInputContentParamOfInputText(c.Text))
+		case agent.ContentTypeImage:
+			parts = append(parts, responses.ResponseInputContentUnionParam{
+				OfInputImage: &responses.ResponseInputImageParam{
+					Detail:   responses.ResponseInputImageDetailAuto,
+					ImageURL: openai.String(fmt.Sprintf("data:%s;base64,%s", c.MediaType, c.Data)),
+				},
+			})
+		}
+	}
+	return parts
+}
+
+func responseOutputToContent(output []responses.ResponseOutputItemUnion) []agent.MessageContent {
+	var out []agent.MessageContent
+	for _, item := range output {
+		switch item.Type {
+		case "message":
+			msg := item.AsMessage()
+			for _, part := range msg.Content {
+				if part.Type == "output_text" && part.Text != "" {
+					out = append(out, agent.NewTextContent(part.Text))
+				}
+			}
+		case "function_call":
+			call := item.AsFunctionCall()
+			callID := call.CallID
+			if callID == "" {
+				callID = call.ID
+			}
+			out = append(out, agent.MessageContent{
+				Type: agent.ContentTypeToolUse,
+				ToolUse: &agent.ToolUse{
+					ID:    callID,
+					Name:  call.Name,
+					Input: normalizeToolCallArguments(call.Arguments),
+				},
+			})
+		}
+	}
+	return out
 }
 
 type streamedToolCall struct {
@@ -352,6 +592,11 @@ func (c *Client) buildChatCompletionParams(req agent.MessagesRequest) openai.Cha
 func usesMaxCompletionTokens(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
 	return strings.HasPrefix(m, "gpt-5") || strings.HasPrefix(m, "o3")
+}
+
+func usesResponsesAPI(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.Contains(m, "codex")
 }
 
 // convertMessage converts agent message to OpenAI format
