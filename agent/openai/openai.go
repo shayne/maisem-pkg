@@ -324,6 +324,7 @@ func (c *Client) buildResponsesParams(req agent.MessagesRequest) responses.Respo
 
 func convertToResponsesInput(messages []agent.Message) responses.ResponseInputParam {
 	var out responses.ResponseInputParam
+	nextAssistantMessageID := 1
 
 	for _, m := range messages {
 		switch m.Role {
@@ -338,7 +339,9 @@ func convertToResponsesInput(messages []agent.Message) responses.ResponseInputPa
 				))
 			}
 		case agent.RoleAssistant:
-			out = append(out, assistantMessageToResponsesItems(m.Content)...)
+			var assistantItems []responses.ResponseInputItemUnionParam
+			assistantItems, nextAssistantMessageID = assistantMessageToResponsesItems(m.Content, nextAssistantMessageID)
+			out = append(out, assistantItems...)
 		case agent.RoleSystem:
 			parts := contentToResponsesParts(m.Content)
 			if len(parts) == 0 {
@@ -357,7 +360,7 @@ func convertToResponsesInput(messages []agent.Message) responses.ResponseInputPa
 	return out
 }
 
-func assistantMessageToResponsesItems(content agent.Content) []responses.ResponseInputItemUnionParam {
+func assistantMessageToResponsesItems(content agent.Content, nextMessageID int) ([]responses.ResponseInputItemUnionParam, int) {
 	var out []responses.ResponseInputItemUnionParam
 	var textParts []responses.ResponseOutputMessageContentUnionParam
 
@@ -365,9 +368,11 @@ func assistantMessageToResponsesItems(content agent.Content) []responses.Respons
 		if len(textParts) == 0 {
 			return
 		}
+		msgID := fmt.Sprintf("msg_history_assistant_%d", nextMessageID)
+		nextMessageID++
 		out = append(out, responses.ResponseInputItemParamOfOutputMessage(
 			textParts,
-			fmt.Sprintf("history_assistant_%d", len(out)+1),
+			msgID,
 			responses.ResponseOutputMessageStatusCompleted,
 		))
 		textParts = nil
@@ -399,7 +404,7 @@ func assistantMessageToResponsesItems(content agent.Content) []responses.Respons
 	}
 
 	flushText()
-	return out
+	return out, nextMessageID
 }
 
 func contentToResponsesParts(content agent.Content) responses.ResponseInputMessageContentListParam {

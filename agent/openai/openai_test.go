@@ -177,10 +177,49 @@ func TestConvertToResponsesInput_AssistantTextUsesOutputText(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected map content part, got %#v", content[0])
 	}
+	id, _ := items[0]["id"].(string)
+	if !strings.HasPrefix(id, "msg") {
+		t.Fatalf("assistant history id must start with msg, got %q (payload=%s)", id, string(raw))
+	}
 	if got := part["type"]; got != "output_text" {
 		t.Fatalf("assistant history must use output_text, got %v (payload=%s)", got, string(raw))
 	}
 	if got := part["text"]; got != "hello from assistant history" {
 		t.Fatalf("assistant text mismatch: got %v", got)
+	}
+}
+
+func TestConvertToResponsesInput_AssistantIDsAreUnique(t *testing.T) {
+	input := convertToResponsesInput([]agent.Message{
+		{
+			Role:    agent.RoleAssistant,
+			Content: agent.Content{agent.NewTextContent("first")},
+		},
+		{
+			Role:    agent.RoleAssistant,
+			Content: agent.Content{agent.NewTextContent("second")},
+		},
+	})
+
+	raw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+
+	var items []map[string]any
+	if err := json.Unmarshal(raw, &items); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected 2 input items, got %d (%s)", len(items), string(raw))
+	}
+
+	firstID, _ := items[0]["id"].(string)
+	secondID, _ := items[1]["id"].(string)
+	if firstID == secondID {
+		t.Fatalf("assistant message IDs must be unique, both were %q (payload=%s)", firstID, string(raw))
+	}
+	if !strings.HasPrefix(firstID, "msg") || !strings.HasPrefix(secondID, "msg") {
+		t.Fatalf("assistant message IDs must start with msg, got %q and %q", firstID, secondID)
 	}
 }
