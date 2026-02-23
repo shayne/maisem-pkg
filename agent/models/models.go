@@ -28,9 +28,11 @@ const (
 	Claude4Sonnet20250514 = "claude-sonnet-4-20250514"
 	Claude4SonnetLatest   = Claude4Sonnet20250514
 
-	GPT5        = "gpt-5"
-	GPT52       = "gpt-5.2"
-	GPT52Latest = GPT52
+	GPT5             = "gpt-5"
+	GPT52            = "gpt-5.2"
+	GPT52Latest      = GPT52
+	GPT53Codex       = "gpt-5.3-codex"
+	GPT53CodexLatest = GPT53Codex
 
 	DefaultModel      = Claude3Dot5SonnetLatest
 	DefaultSmallModel = Claude3Dot5HaikuLatest

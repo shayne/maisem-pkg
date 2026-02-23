@@ -29,7 +29,7 @@ func paramsAsMap(t *testing.T, params any) map[string]any {
 }
 
 func TestBuildChatCompletionParams_GPT5FamilyUsesMaxCompletionTokens(t *testing.T) {
-	client := &Client{model: "gpt-5.2"}
+	client := &Client{model: "gpt-5.3-codex"}
 	params := client.buildChatCompletionParams(agent.MessagesRequest{MaxTokens: 321})
 	asMap := paramsAsMap(t, params)
 
