@@ -145,3 +145,42 @@ func TestUsesResponsesAPI_CodexModels(t *testing.T) {
 		t.Fatalf("expected non-codex model to use chat completions API")
 	}
 }
+
+func TestConvertToResponsesInput_AssistantTextUsesOutputText(t *testing.T) {
+	input := convertToResponsesInput([]agent.Message{
+		{
+			Role: agent.RoleAssistant,
+			Content: agent.Content{
+				agent.NewTextContent("hello from assistant history"),
+			},
+		},
+	})
+
+	raw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+
+	var items []map[string]any
+	if err := json.Unmarshal(raw, &items); err != nil {
+		t.Fatalf("json.Unmarshal: %v", err)
+	}
+	if len(items) != 1 {
+		t.Fatalf("expected 1 input item, got %d (%s)", len(items), string(raw))
+	}
+
+	content, ok := items[0]["content"].([]any)
+	if !ok || len(content) != 1 {
+		t.Fatalf("expected one content part, got %#v", items[0]["content"])
+	}
+	part, ok := content[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected map content part, got %#v", content[0])
+	}
+	if got := part["type"]; got != "output_text" {
+		t.Fatalf("assistant history must use output_text, got %v (payload=%s)", got, string(raw))
+	}
+	if got := part["text"]; got != "hello from assistant history" {
+		t.Fatalf("assistant text mismatch: got %v", got)
+	}
+}

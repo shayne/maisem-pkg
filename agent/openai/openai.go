@@ -359,20 +359,28 @@ func convertToResponsesInput(messages []agent.Message) responses.ResponseInputPa
 
 func assistantMessageToResponsesItems(content agent.Content) []responses.ResponseInputItemUnionParam {
 	var out []responses.ResponseInputItemUnionParam
-	var textParts responses.ResponseInputMessageContentListParam
+	var textParts []responses.ResponseOutputMessageContentUnionParam
 
 	flushText := func() {
 		if len(textParts) == 0 {
 			return
 		}
-		out = append(out, responses.ResponseInputItemParamOfMessage(textParts, responses.EasyInputMessageRoleAssistant))
+		out = append(out, responses.ResponseInputItemParamOfOutputMessage(
+			textParts,
+			fmt.Sprintf("history_assistant_%d", len(out)+1),
+			responses.ResponseOutputMessageStatusCompleted,
+		))
 		textParts = nil
 	}
 
 	for _, c := range content {
 		switch c.Type {
 		case agent.ContentTypeText:
-			textParts = append(textParts, responses.ResponseInputContentParamOfInputText(c.Text))
+			textParts = append(textParts, responses.ResponseOutputMessageContentUnionParam{
+				OfOutputText: &responses.ResponseOutputTextParam{
+					Text: c.Text,
+				},
+			})
 		case agent.ContentTypeToolUse:
 			if c.ToolUse == nil {
 				continue
