@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -85,6 +86,8 @@ func (c *Client) CountTokens(ctx context.Context, req agent.MessagesRequest) (in
 }
 
 func (c *Client) CreateMessages(ctx context.Context, req agent.MessagesRequest, onUpdate func(agent.MessagesResponse)) (agent.MessagesResponse, error) {
+	_ = onUpdate
+
 	// Convert our request to OpenAI request
 	params := c.buildChatCompletionParams(req)
 
@@ -94,6 +97,8 @@ func (c *Client) CreateMessages(ctx context.Context, req agent.MessagesRequest, 
 	stream := c.client.Chat.Completions.NewStreaming(ctx, params)
 
 	var collectedContent []agent.MessageContent
+	toolCallsByIndex := map[int64]*streamedToolCall{}
+	var toolCallOrder []int64
 	var id string
 	var finishReason string
 	var usage openai.CompletionUsage
@@ -129,19 +134,8 @@ func (c *Client) CreateMessages(ctx context.Context, req agent.MessagesRequest, 
 				textContent.Text += choice.Delta.Content
 			}
 
-			// Handle tool calls
-			for _, toolCall := range choice.Delta.ToolCalls {
-				if toolCall.Function.Name != "" {
-					collectedContent = append(collectedContent, agent.MessageContent{
-						Type: agent.ContentTypeToolUse,
-						ToolUse: &agent.ToolUse{
-							ID:    toolCall.ID,
-							Name:  toolCall.Function.Name,
-							Input: json.RawMessage(toolCall.Function.Arguments),
-						},
-					})
-				}
-			}
+			// Handle tool calls (arguments stream across chunks).
+			collectStreamToolCalls(choice.Delta.ToolCalls, toolCallsByIndex, &toolCallOrder)
 
 			// Set finish reason
 			if choice.FinishReason != "" {
@@ -165,6 +159,9 @@ func (c *Client) CreateMessages(ctx context.Context, req agent.MessagesRequest, 
 	if finishReason == "length" {
 		return agent.MessagesResponse{}, fmt.Errorf("%w: %v", agent.ErrTooLarge, finishReason)
 	}
+
+	// Finalize streamed tool calls into complete tool_use content blocks.
+	collectedContent = append(collectedContent, buildToolUseContents(toolCallsByIndex, toolCallOrder)...)
 
 	// Build response with usage data
 	responseUsage := agent.Usage{
@@ -203,6 +200,85 @@ func (c *Client) CreateMessages(ctx context.Context, req agent.MessagesRequest, 
 	}
 
 	return response, nil
+}
+
+type streamedToolCall struct {
+	ID        string
+	Name      string
+	Arguments strings.Builder
+}
+
+func collectStreamToolCalls(deltas []openai.ChatCompletionChunkChoiceDeltaToolCall, byIndex map[int64]*streamedToolCall, order *[]int64) {
+	for _, tc := range deltas {
+		state, ok := byIndex[tc.Index]
+		if !ok {
+			state = &streamedToolCall{}
+			byIndex[tc.Index] = state
+			*order = append(*order, tc.Index)
+		}
+		if tc.ID != "" {
+			state.ID = tc.ID
+		}
+		if tc.Function.Name != "" {
+			state.Name = tc.Function.Name
+		}
+		if tc.Function.Arguments != "" {
+			state.Arguments.WriteString(tc.Function.Arguments)
+		}
+	}
+}
+
+func buildToolUseContents(byIndex map[int64]*streamedToolCall, order []int64) []agent.MessageContent {
+	if len(order) == 0 {
+		return nil
+	}
+
+	ordered := append([]int64(nil), order...)
+	sort.Slice(ordered, func(i, j int) bool {
+		return ordered[i] < ordered[j]
+	})
+
+	out := make([]agent.MessageContent, 0, len(ordered))
+	for _, idx := range ordered {
+		tc := byIndex[idx]
+		if tc == nil || tc.Name == "" {
+			continue
+		}
+
+		id := tc.ID
+		if id == "" {
+			id = fmt.Sprintf("call_%d", idx)
+		}
+
+		out = append(out, agent.MessageContent{
+			Type: agent.ContentTypeToolUse,
+			ToolUse: &agent.ToolUse{
+				ID:    id,
+				Name:  tc.Name,
+				Input: normalizeToolCallArguments(tc.Arguments.String()),
+			},
+		})
+	}
+
+	return out
+}
+
+func normalizeToolCallArguments(raw string) json.RawMessage {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return json.RawMessage("{}")
+	}
+	if json.Valid([]byte(trimmed)) {
+		return json.RawMessage(trimmed)
+	}
+
+	// Keep invalid model output as a JSON string literal so persistence succeeds
+	// and downstream tool decoding can fail safely and explicitly.
+	fallback, err := json.Marshal(trimmed)
+	if err != nil {
+		return json.RawMessage(`""`)
+	}
+	return json.RawMessage(fallback)
 }
 
 // buildChatCompletionParams converts agent request to OpenAI params
