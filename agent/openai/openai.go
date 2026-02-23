@@ -294,7 +294,9 @@ func (c *Client) buildResponsesParams(req agent.MessagesRequest) responses.Respo
 					Name:        t.Name,
 					Description: openai.String(t.Description),
 					Parameters:  schema,
-					Strict:      openai.Bool(true),
+					// Responses strict mode requires all properties to be listed in required.
+					// Keep tool schemas non-strict so optional fields remain valid.
+					Strict: openai.Bool(false),
 				},
 			})
 		}

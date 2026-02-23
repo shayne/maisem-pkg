@@ -62,6 +62,37 @@ func TestBuildChatCompletionParams_NonGPT5UsesMaxTokens(t *testing.T) {
 	}
 }
 
+func TestBuildResponsesParams_ToolsDoNotForceStrictSchema(t *testing.T) {
+	client := &Client{model: "gpt-5.3-codex"}
+	params := client.buildResponsesParams(agent.MessagesRequest{
+		Tools: []agent.ToolDefinition{{
+			Name:        "create-reminder",
+			Description: "Create a reminder",
+			InputSchema: json.RawMessage(`{
+				"type": "object",
+				"properties": {
+					"message": {"type": "string"},
+					"requires_acknowledgement": {"type": "boolean"}
+				},
+				"required": ["message"]
+			}`),
+		}},
+	})
+	asMap := paramsAsMap(t, params)
+
+	tools, ok := asMap["tools"].([]any)
+	if !ok || len(tools) != 1 {
+		t.Fatalf("expected one tool in responses params, got %#v", asMap["tools"])
+	}
+	tool, ok := tools[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tool entry to be a map, got %#v", tools[0])
+	}
+	if got, has := tool["strict"]; has && got == true {
+		t.Fatalf("expected strict schema to be disabled for responses tools, got strict=%v payload=%v", got, tool)
+	}
+}
+
 func TestNormalizeToolCallArguments_EmptyDefaultsToObject(t *testing.T) {
 	got := normalizeToolCallArguments("")
 	if string(got) != "{}" {
