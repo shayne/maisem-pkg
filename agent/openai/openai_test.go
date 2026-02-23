@@ -93,6 +93,61 @@ func TestBuildResponsesParams_ToolsDoNotForceStrictSchema(t *testing.T) {
 	}
 }
 
+func TestBuildResponsesParams_UsesPreviousResponseID(t *testing.T) {
+	client := &Client{model: "gpt-5.3-codex"}
+	params := client.buildResponsesParams(agent.MessagesRequest{
+		ConversationState: &agent.ConversationState{
+			PreviousResponseID: "  resp_123  ",
+		},
+	})
+	asMap := paramsAsMap(t, params)
+
+	got, ok := asMap["previous_response_id"]
+	if !ok {
+		t.Fatalf("expected previous_response_id to be present, payload=%v", asMap)
+	}
+	if got != "resp_123" {
+		t.Fatalf("previous_response_id mismatch: got=%v want=resp_123", got)
+	}
+}
+
+func TestBuildResponsesParams_OmitsPreviousResponseIDWhenEmpty(t *testing.T) {
+	tests := []struct {
+		name string
+		req  agent.MessagesRequest
+	}{
+		{
+			name: "missing conversation state",
+			req:  agent.MessagesRequest{},
+		},
+		{
+			name: "empty previous response id",
+			req: agent.MessagesRequest{
+				ConversationState: &agent.ConversationState{},
+			},
+		},
+		{
+			name: "whitespace previous response id",
+			req: agent.MessagesRequest{
+				ConversationState: &agent.ConversationState{
+					PreviousResponseID: "   ",
+				},
+			},
+		},
+	}
+
+	client := &Client{model: "gpt-5.3-codex"}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			params := client.buildResponsesParams(tt.req)
+			asMap := paramsAsMap(t, params)
+			if got, ok := asMap["previous_response_id"]; ok {
+				t.Fatalf("expected previous_response_id to be omitted, got=%v payload=%v", got, asMap)
+			}
+		})
+	}
+}
+
 func TestNormalizeToolCallArguments_EmptyDefaultsToObject(t *testing.T) {
 	got := normalizeToolCallArguments("")
 	if string(got) != "{}" {

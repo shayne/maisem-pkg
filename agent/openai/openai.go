@@ -274,6 +274,12 @@ func (c *Client) buildResponsesParams(req agent.MessagesRequest) responses.Respo
 	if req.MaxTokens > 0 {
 		params.MaxOutputTokens = openai.Int(int64(req.MaxTokens))
 	}
+	if req.ConversationState != nil {
+		previousResponseID := strings.TrimSpace(req.ConversationState.PreviousResponseID)
+		if previousResponseID != "" {
+			params.PreviousResponseID = openai.String(previousResponseID)
+		}
+	}
 
 	input := convertToResponsesInput(req.Messages)
 	if len(input) > 0 {

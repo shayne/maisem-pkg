@@ -164,18 +164,22 @@ func (src *MessagesRequest) Clone() *MessagesRequest {
 	if dst.ToolChoice != nil {
 		dst.ToolChoice = ptr.To(*src.ToolChoice)
 	}
+	if dst.ConversationState != nil {
+		dst.ConversationState = ptr.To(*src.ConversationState)
+	}
 	return dst
 }
 
 // A compilation failure here means this code must be regenerated, with the command at the top of this file.
 var _MessagesRequestCloneNeedsRegeneration = MessagesRequest(struct {
-	System         string
-	MaxTokens      int
-	Messages       []Message
-	Tools          []ToolDefinition
-	ToolChoice     *ToolChoice
-	ThinkingMode   bool
-	ThinkingTokens int
+	System            string
+	MaxTokens         int
+	Messages          []Message
+	Tools             []ToolDefinition
+	ToolChoice        *ToolChoice
+	ThinkingMode      bool
+	ThinkingTokens    int
+	ConversationState *ConversationState
 }{})
 
 // Clone makes a deep copy of MessagesResponse.

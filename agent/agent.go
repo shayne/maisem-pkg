@@ -325,6 +325,13 @@ type TokenCounter interface {
 	CountTokens(ctx context.Context, req MessagesRequest) (int, error)
 }
 
+// ConversationState carries provider-agnostic continuation state for a conversation.
+// Providers that support response chaining can use this data to continue from a prior response.
+type ConversationState struct {
+	// PreviousResponseID is the provider response ID to continue from when supported.
+	PreviousResponseID string `json:"previous_response_id,omitempty"`
+}
+
 // MessagesRequest represents a request to create messages through an LLM service.
 // It contains all the necessary information to generate a response, including
 // the conversation history, available tools, and configuration parameters.
@@ -364,6 +371,10 @@ type MessagesRequest struct {
 	// Only applies when ThinkingMode is true. A value of 0 means the default (typically 1024).
 	// The provider should ignore this field if it does not support ThinkingMode.
 	ThinkingTokens int `json:"thinking_tokens,omitempty"`
+
+	// ConversationState contains optional state for continuing an existing conversation.
+	// Providers that do not support this should ignore it.
+	ConversationState *ConversationState `json:"conversation_state,omitempty"`
 }
 
 // MessagesResponse represents a response from creating messages via an LLM service.
