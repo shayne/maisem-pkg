@@ -356,6 +356,36 @@ func TestResponseOutputToContentReportsIgnoredMessagePartTypesAndNoSupportedCont
 	}
 }
 
+func TestUnsupportedResponsesNoContentError_AllowsEmptyOutputTextOnlyNoop(t *testing.T) {
+	var output []responses.ResponseOutputItemUnion
+	if err := json.Unmarshal([]byte(`[
+		{
+			"id":"msg_empty_1",
+			"type":"message",
+			"status":"completed",
+			"role":"assistant",
+			"content":[{"type":"output_text","text":"","annotations":[]}]
+		}
+	]`), &output); err != nil {
+		t.Fatalf("json.Unmarshal output items: %v", err)
+	}
+
+	content, dropped, ignoredParts := responseOutputToContentWithUnhandled(output)
+	if got := len(content); got != 0 {
+		t.Fatalf("content item count = %d, want 0 for empty output_text-only message", got)
+	}
+	if len(dropped) != 0 {
+		t.Fatalf("dropped output item types = %v, want none", dropped)
+	}
+	if got := ignoredParts["output_text_empty"]; got != 1 {
+		t.Fatalf("ignored empty output_text part count = %d, want 1 (ignored=%v)", got, ignoredParts)
+	}
+
+	if err := unsupportedResponsesNoContentError(output, dropped, ignoredParts); err != nil {
+		t.Fatalf("expected empty output_text-only message to be treated as benign no-op, got error: %v", err)
+	}
+}
+
 func TestConvertToResponsesInput_AssistantTextUsesOutputText(t *testing.T) {
 	input := convertToResponsesInput([]agent.Message{
 		{

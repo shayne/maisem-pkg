@@ -256,6 +256,9 @@ func (c *Client) createMessagesWithResponses(ctx context.Context, req agent.Mess
 			}
 			return agent.MessagesResponse{}, err
 		}
+		if c.logf != nil && isBenignEmptyOutputTextOnlyNoop(resp.Output, droppedOutputTypes, ignoredMessagePartTypes) {
+			c.logf("openai_responses: no_actionable_content treated_as=noop reason=output_text_empty_only")
+		}
 	}
 	responseUsage := agent.Usage{
 		InputTokens:  int(resp.Usage.InputTokens),
@@ -557,6 +560,9 @@ func unsupportedResponsesNoContentError(output []responses.ResponseOutputItemUni
 	if len(output) == 0 {
 		return nil
 	}
+	if isBenignEmptyOutputTextOnlyNoop(output, droppedOutputTypes, ignoredMessagePartTypes) {
+		return nil
+	}
 	outputItemTypes := make(map[string]int)
 	for _, item := range output {
 		typ := strings.TrimSpace(item.Type)
@@ -574,6 +580,23 @@ func unsupportedResponsesNoContentError(output []responses.ResponseOutputItemUni
 		details = append(details, fmt.Sprintf("dropped_output_items=%s", formatTypeCountMap(droppedOutputTypes)))
 	}
 	return fmt.Errorf("openai responses returned no supported actionable content (%s)", strings.Join(details, " "))
+}
+
+func isBenignEmptyOutputTextOnlyNoop(output []responses.ResponseOutputItemUnion, droppedOutputTypes, ignoredMessagePartTypes map[string]int) bool {
+	if len(output) == 0 || len(droppedOutputTypes) > 0 || len(ignoredMessagePartTypes) == 0 {
+		return false
+	}
+	for typ, count := range ignoredMessagePartTypes {
+		if typ != "output_text_empty" || count <= 0 {
+			return false
+		}
+	}
+	for _, item := range output {
+		if strings.TrimSpace(item.Type) != "message" {
+			return false
+		}
+	}
+	return true
 }
 
 func formatTypeCountMap(m map[string]int) string {
