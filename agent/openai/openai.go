@@ -222,12 +222,13 @@ func (c *Client) CreateMessages(ctx context.Context, req agent.MessagesRequest, 
 
 func (c *Client) createMessagesWithResponses(ctx context.Context, req agent.MessagesRequest) (agent.MessagesResponse, error) {
 	params := c.buildResponsesParams(req)
+	prevResponseSet := req.ConversationState != nil && strings.TrimSpace(req.ConversationState.PreviousResponseID) != ""
 	if c.logf != nil {
 		c.logf(
 			"openai_responses: request_state_mode=%s messages=%d prev_response_set=%t",
 			responsesRequestStateMode(req),
 			len(req.Messages),
-			req.ConversationState != nil && strings.TrimSpace(req.ConversationState.PreviousResponseID) != "",
+			prevResponseSet,
 		)
 	}
 
@@ -250,13 +251,13 @@ func (c *Client) createMessagesWithResponses(ctx context.Context, req agent.Mess
 		c.logf("openai_responses: ignored_message_parts=%s", formatTypeCountMap(ignoredMessagePartTypes))
 	}
 	if !hasActionableResponsesContent(collectedContent) {
-		if err := unsupportedResponsesNoContentError(resp.Output, droppedOutputTypes, ignoredMessagePartTypes); err != nil {
+		if err := unsupportedResponsesNoContentError(resp.Output, droppedOutputTypes, ignoredMessagePartTypes, prevResponseSet); err != nil {
 			if c.logf != nil {
 				c.logf("openai_responses: %v", err)
 			}
 			return agent.MessagesResponse{}, err
 		}
-		if c.logf != nil && isBenignEmptyOutputTextOnlyNoop(resp.Output, droppedOutputTypes, ignoredMessagePartTypes) {
+		if c.logf != nil && prevResponseSet && isBenignEmptyOutputTextOnlyNoop(resp.Output, droppedOutputTypes, ignoredMessagePartTypes) {
 			c.logf("openai_responses: no_actionable_content treated_as=noop reason=output_text_empty_only")
 		}
 	}
@@ -556,11 +557,11 @@ func hasActionableResponsesContent(content []agent.MessageContent) bool {
 	return false
 }
 
-func unsupportedResponsesNoContentError(output []responses.ResponseOutputItemUnion, droppedOutputTypes, ignoredMessagePartTypes map[string]int) error {
+func unsupportedResponsesNoContentError(output []responses.ResponseOutputItemUnion, droppedOutputTypes, ignoredMessagePartTypes map[string]int, allowBenignEmptyOutputTextOnlyNoop bool) error {
 	if len(output) == 0 {
 		return nil
 	}
-	if isBenignEmptyOutputTextOnlyNoop(output, droppedOutputTypes, ignoredMessagePartTypes) {
+	if allowBenignEmptyOutputTextOnlyNoop && isBenignEmptyOutputTextOnlyNoop(output, droppedOutputTypes, ignoredMessagePartTypes) {
 		return nil
 	}
 	outputItemTypes := make(map[string]int)

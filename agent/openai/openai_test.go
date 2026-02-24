@@ -347,7 +347,7 @@ func TestResponseOutputToContentReportsIgnoredMessagePartTypesAndNoSupportedCont
 		t.Fatalf("ignored refusal part count = %d, want 1 (ignored=%v)", got, ignoredParts)
 	}
 
-	err := unsupportedResponsesNoContentError(output, dropped, ignoredParts)
+	err := unsupportedResponsesNoContentError(output, dropped, ignoredParts, false)
 	if err == nil {
 		t.Fatalf("expected refusal-only output to produce a clear unsupported-content error")
 	}
@@ -356,7 +356,7 @@ func TestResponseOutputToContentReportsIgnoredMessagePartTypesAndNoSupportedCont
 	}
 }
 
-func TestUnsupportedResponsesNoContentError_AllowsEmptyOutputTextOnlyNoop(t *testing.T) {
+func TestUnsupportedResponsesNoContentError_EmptyOutputTextOnlyRequiresContinuationFlag(t *testing.T) {
 	var output []responses.ResponseOutputItemUnion
 	if err := json.Unmarshal([]byte(`[
 		{
@@ -381,8 +381,11 @@ func TestUnsupportedResponsesNoContentError_AllowsEmptyOutputTextOnlyNoop(t *tes
 		t.Fatalf("ignored empty output_text part count = %d, want 1 (ignored=%v)", got, ignoredParts)
 	}
 
-	if err := unsupportedResponsesNoContentError(output, dropped, ignoredParts); err != nil {
-		t.Fatalf("expected empty output_text-only message to be treated as benign no-op, got error: %v", err)
+	if err := unsupportedResponsesNoContentError(output, dropped, ignoredParts, false); err == nil {
+		t.Fatalf("expected top-level empty output_text-only message to remain an error without continuation flag")
+	}
+	if err := unsupportedResponsesNoContentError(output, dropped, ignoredParts, true); err != nil {
+		t.Fatalf("expected continuation empty output_text-only message to be treated as benign no-op, got error: %v", err)
 	}
 }
 
