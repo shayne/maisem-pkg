@@ -25,11 +25,18 @@ type Client struct {
 	client *openai.Client
 	model  string
 	logf   func(string, ...any)
+
+	// responsesNewHook is used in tests to stub Responses API calls.
+	responsesNewHook func(context.Context, responses.ResponseNewParams) (*responses.Response, error)
 }
 
 var _ agent.LLMClient = (*Client)(nil)
 var _ agent.TokenCounter = (*Client)(nil)
 var _ agent.PreviousResponseIDSupport = (*Client)(nil)
+
+// ErrResponsesEmptyCompletedMessage is returned when the Responses API reports a
+// completed assistant message but provides only empty output_text content.
+var ErrResponsesEmptyCompletedMessage = errors.New("openai responses returned empty completed message")
 
 // New creates a new Client
 func New(apiKey, model string) *Client {
@@ -232,37 +239,63 @@ func (c *Client) createMessagesWithResponses(ctx context.Context, req agent.Mess
 		)
 	}
 
-	start := time.Now()
-	resp, err := c.client.Responses.New(ctx, params)
-	if err != nil {
-		return agent.MessagesResponse{}, c.handleError(err)
-	}
-	responseTime := time.Since(start)
-
-	if resp.Status == "incomplete" && resp.IncompleteDetails.Reason == "max_output_tokens" {
-		return agent.MessagesResponse{}, fmt.Errorf("%w: %s", agent.ErrTooLarge, resp.IncompleteDetails.Reason)
-	}
-
-	collectedContent, droppedOutputTypes, ignoredMessagePartTypes := responseOutputToContentWithUnhandled(resp.Output)
-	if c.logf != nil && len(droppedOutputTypes) > 0 {
-		c.logf("openai_responses: dropped_output_items=%s", formatTypeCountMap(droppedOutputTypes))
-	}
-	if c.logf != nil && len(ignoredMessagePartTypes) > 0 {
-		c.logf("openai_responses: ignored_message_parts=%s", formatTypeCountMap(ignoredMessagePartTypes))
-	}
-	if !hasActionableResponsesContent(collectedContent) {
-		if c.logf != nil {
-			c.logf("openai_responses: no_actionable_content_details=%s", responsesNoContentDiagnosticsSummary(resp, droppedOutputTypes, ignoredMessagePartTypes))
+	var (
+		resp                    *responses.Response
+		err                     error
+		responseTime            time.Duration
+		collectedContent        []agent.MessageContent
+		droppedOutputTypes      map[string]int
+		ignoredMessagePartTypes map[string]int
+		emptyOutputRetryUsed    bool
+	)
+	for {
+		start := time.Now()
+		resp, err = c.responsesNew(ctx, params)
+		if err != nil {
+			return agent.MessagesResponse{}, c.handleError(err)
 		}
-		if err := unsupportedResponsesNoContentError(resp, droppedOutputTypes, ignoredMessagePartTypes, prevResponseSet); err != nil {
+		responseTime = time.Since(start)
+
+		if resp.Status == "incomplete" && resp.IncompleteDetails.Reason == "max_output_tokens" {
+			return agent.MessagesResponse{}, fmt.Errorf("%w: %s", agent.ErrTooLarge, resp.IncompleteDetails.Reason)
+		}
+
+		collectedContent, droppedOutputTypes, ignoredMessagePartTypes = responseOutputToContentWithUnhandled(resp.Output)
+		if c.logf != nil && len(droppedOutputTypes) > 0 {
+			c.logf("openai_responses: dropped_output_items=%s", formatTypeCountMap(droppedOutputTypes))
+		}
+		if c.logf != nil && len(ignoredMessagePartTypes) > 0 {
+			c.logf("openai_responses: ignored_message_parts=%s", formatTypeCountMap(ignoredMessagePartTypes))
+		}
+		if !hasActionableResponsesContent(collectedContent) {
+			diagnostics := responsesNoContentDiagnosticsSummary(resp, droppedOutputTypes, ignoredMessagePartTypes)
 			if c.logf != nil {
-				c.logf("openai_responses: %v", err)
+				c.logf("openai_responses: no_actionable_content_details=%s", diagnostics)
 			}
-			return agent.MessagesResponse{}, err
+			if shouldRetryTopLevelEmptyOutputTextOnlyNoActionable(prevResponseSet, req, resp, droppedOutputTypes, ignoredMessagePartTypes, emptyOutputRetryUsed) {
+				emptyOutputRetryUsed = true
+				if c.logf != nil {
+					c.logf("openai_responses: retry_triggered reason=top_level_empty_output_text_only attempt=1")
+				}
+				continue
+			}
+			if err := unsupportedResponsesNoContentError(resp, droppedOutputTypes, ignoredMessagePartTypes, prevResponseSet); err != nil {
+				if c.logf != nil {
+					if emptyOutputRetryUsed && errors.Is(err, ErrResponsesEmptyCompletedMessage) {
+						c.logf("openai_responses: retry_outcome=failed reason=top_level_empty_output_text_only")
+					}
+					c.logf("openai_responses: %v", err)
+				}
+				return agent.MessagesResponse{}, err
+			}
+			if c.logf != nil && prevResponseSet && isBenignEmptyOutputTextOnlyNoop(resp.Output, droppedOutputTypes, ignoredMessagePartTypes) {
+				c.logf("openai_responses: no_actionable_content treated_as=noop reason=output_text_empty_only")
+			}
 		}
-		if c.logf != nil && prevResponseSet && isBenignEmptyOutputTextOnlyNoop(resp.Output, droppedOutputTypes, ignoredMessagePartTypes) {
-			c.logf("openai_responses: no_actionable_content treated_as=noop reason=output_text_empty_only")
+		if emptyOutputRetryUsed && c.logf != nil {
+			c.logf("openai_responses: retry_outcome=success reason=top_level_empty_output_text_only")
 		}
+		break
 	}
 	responseUsage := agent.Usage{
 		InputTokens:  int(resp.Usage.InputTokens),
@@ -303,6 +336,13 @@ func (c *Client) createMessagesWithResponses(ctx context.Context, req agent.Mess
 		ResponseTime:     responseTime,
 		Usage:            responseUsage,
 	}, nil
+}
+
+func (c *Client) responsesNew(ctx context.Context, params responses.ResponseNewParams) (*responses.Response, error) {
+	if c.responsesNewHook != nil {
+		return c.responsesNewHook(ctx, params)
+	}
+	return c.client.Responses.New(ctx, params)
 }
 
 func (c *Client) buildResponsesParams(req agent.MessagesRequest) responses.ResponseNewParams {
@@ -573,8 +613,11 @@ func unsupportedResponsesNoContentError(resp *responses.Response, droppedOutputT
 	if len(resp.Output) == 0 {
 		return nil
 	}
-	if allowBenignEmptyOutputTextOnlyNoop && isBenignEmptyOutputTextOnlyNoop(resp.Output, droppedOutputTypes, ignoredMessagePartTypes) {
-		return nil
+	if isBenignEmptyOutputTextOnlyNoop(resp.Output, droppedOutputTypes, ignoredMessagePartTypes) {
+		if allowBenignEmptyOutputTextOnlyNoop {
+			return nil
+		}
+		return fmt.Errorf("%w (%s)", ErrResponsesEmptyCompletedMessage, responsesNoContentDiagnosticsSummary(resp, droppedOutputTypes, ignoredMessagePartTypes))
 	}
 	return fmt.Errorf("openai responses returned no supported actionable content (%s)", responsesNoContentDiagnosticsSummary(resp, droppedOutputTypes, ignoredMessagePartTypes))
 }
@@ -649,6 +692,16 @@ func responseOutputItemStatusCounts(output []responses.ResponseOutputItemUnion) 
 		counts[fmt.Sprintf("%s:%s", typ, status)]++
 	}
 	return counts
+}
+
+func shouldRetryTopLevelEmptyOutputTextOnlyNoActionable(prevResponseSet bool, req agent.MessagesRequest, resp *responses.Response, droppedOutputTypes, ignoredMessagePartTypes map[string]int, retryUsed bool) bool {
+	if retryUsed || prevResponseSet || resp == nil {
+		return false
+	}
+	if len(req.Messages) == 0 {
+		return false
+	}
+	return isBenignEmptyOutputTextOnlyNoop(resp.Output, droppedOutputTypes, ignoredMessagePartTypes)
 }
 
 func isBenignEmptyOutputTextOnlyNoop(output []responses.ResponseOutputItemUnion, droppedOutputTypes, ignoredMessagePartTypes map[string]int) bool {

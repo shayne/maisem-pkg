@@ -7,6 +7,7 @@ package openai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -30,9 +31,144 @@ func paramsAsMap(t *testing.T, params any) map[string]any {
 	return out
 }
 
+func responseFromJSON(t *testing.T, raw string) *responses.Response {
+	t.Helper()
+	var resp responses.Response
+	if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+		t.Fatalf("json.Unmarshal response: %v", err)
+	}
+	return &resp
+}
+
 type loopClient struct {
 	t     *testing.T
 	calls int
+}
+
+func TestCreateMessagesWithResponses_RetriesTopLevelEmptyOutputTextOnlyOnce(t *testing.T) {
+	t.Helper()
+
+	callCount := 0
+	c := &Client{
+		model: "gpt-5.3-codex",
+		responsesNewHook: func(ctx context.Context, params responses.ResponseNewParams) (*responses.Response, error) {
+			callCount++
+			switch callCount {
+			case 1:
+				return responseFromJSON(t, `{
+					"id":"resp_empty_1","object":"response","created_at":0,
+					"status":"completed","error":null,"incomplete_details":null,
+					"instructions":null,"metadata":{},"model":"gpt-5.3-codex",
+					"output":[{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"","annotations":[]}]}],
+					"parallel_tool_calls":true,"temperature":1,"tool_choice":"auto","tools":[],"top_p":1,
+					"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":1}
+				}`), nil
+			case 2:
+				return responseFromJSON(t, `{
+					"id":"resp_ok_1","object":"response","created_at":0,
+					"status":"completed","error":null,"incomplete_details":null,
+					"instructions":null,"metadata":{},"model":"gpt-5.3-codex",
+					"output":[{"id":"msg_2","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Dublin.","annotations":[]}]}],
+					"parallel_tool_calls":true,"temperature":1,"tool_choice":"auto","tools":[],"top_p":1,
+					"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}
+				}`), nil
+			default:
+				t.Fatalf("unexpected responses.New call %d", callCount)
+				return nil, nil
+			}
+		},
+	}
+
+	resp, err := c.createMessagesWithResponses(context.Background(), agent.MessagesRequest{
+		Messages: []agent.Message{{
+			Role:    agent.RoleUser,
+			Content: agent.Content{agent.NewTextContent("What is the capital of Ireland?")},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("createMessagesWithResponses error: %v", err)
+	}
+	if callCount != 2 {
+		t.Fatalf("responses.New calls = %d, want 2", callCount)
+	}
+	if got := resp.Content.LossyText(); got != "Dublin." {
+		t.Fatalf("response text = %q, want Dublin.", got)
+	}
+}
+
+func TestCreateMessagesWithResponses_DoesNotRetryContinuationEmptyOutputTextOnlyNoop(t *testing.T) {
+	t.Helper()
+
+	callCount := 0
+	c := &Client{
+		model: "gpt-5.3-codex",
+		responsesNewHook: func(ctx context.Context, params responses.ResponseNewParams) (*responses.Response, error) {
+			callCount++
+			return responseFromJSON(t, `{
+				"id":"resp_cont_empty_1","object":"response","created_at":0,
+				"status":"completed","error":null,"incomplete_details":null,
+				"instructions":null,"metadata":{},"model":"gpt-5.3-codex",
+				"output":[{"id":"msg_3","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"","annotations":[]}]}],
+				"parallel_tool_calls":true,"temperature":1,"tool_choice":"auto","tools":[],"top_p":1,
+				"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":1}
+			}`), nil
+		},
+	}
+
+	resp, err := c.createMessagesWithResponses(context.Background(), agent.MessagesRequest{
+		Messages: []agent.Message{{
+			Role: agent.RoleUser,
+			Content: agent.Content{
+				agent.NewTextContent("continue"),
+			},
+		}},
+		ConversationState: &agent.ConversationState{PreviousResponseID: "resp_prev"},
+	})
+	if err != nil {
+		t.Fatalf("createMessagesWithResponses continuation noop error: %v", err)
+	}
+	if callCount != 1 {
+		t.Fatalf("responses.New calls = %d, want 1 for continuation noop", callCount)
+	}
+	if len(resp.Content) != 0 {
+		t.Fatalf("expected no content for continuation noop, got %#v", resp.Content)
+	}
+}
+
+func TestCreateMessagesWithResponses_EmptyOutputTextOnlyAfterRetryReturnsTypedError(t *testing.T) {
+	t.Helper()
+
+	callCount := 0
+	c := &Client{
+		model: "gpt-5.3-codex",
+		responsesNewHook: func(ctx context.Context, params responses.ResponseNewParams) (*responses.Response, error) {
+			callCount++
+			return responseFromJSON(t, `{
+				"id":"resp_empty_repeat","object":"response","created_at":0,
+				"status":"completed","error":null,"incomplete_details":null,
+				"instructions":null,"metadata":{},"model":"gpt-5.3-codex",
+				"output":[{"id":"msg_empty","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"","annotations":[]}]}],
+				"parallel_tool_calls":true,"temperature":1,"tool_choice":"auto","tools":[],"top_p":1,
+				"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":1}
+			}`), nil
+		},
+	}
+
+	_, err := c.createMessagesWithResponses(context.Background(), agent.MessagesRequest{
+		Messages: []agent.Message{{
+			Role:    agent.RoleUser,
+			Content: agent.Content{agent.NewTextContent("What is the capital of Ireland?")},
+		}},
+	})
+	if err == nil {
+		t.Fatalf("expected error after retry exhaustion")
+	}
+	if !errors.Is(err, ErrResponsesEmptyCompletedMessage) {
+		t.Fatalf("error %v is not ErrResponsesEmptyCompletedMessage", err)
+	}
+	if callCount != 2 {
+		t.Fatalf("responses.New calls = %d, want 2 after retry exhaustion", callCount)
+	}
 }
 
 func TestBuildChatCompletionParams_GPT5FamilyUsesMaxCompletionTokens(t *testing.T) {
