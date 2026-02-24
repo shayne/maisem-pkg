@@ -251,7 +251,10 @@ func (c *Client) createMessagesWithResponses(ctx context.Context, req agent.Mess
 		c.logf("openai_responses: ignored_message_parts=%s", formatTypeCountMap(ignoredMessagePartTypes))
 	}
 	if !hasActionableResponsesContent(collectedContent) {
-		if err := unsupportedResponsesNoContentError(resp.Output, droppedOutputTypes, ignoredMessagePartTypes, prevResponseSet); err != nil {
+		if c.logf != nil {
+			c.logf("openai_responses: no_actionable_content_details=%s", responsesNoContentDiagnosticsSummary(resp, droppedOutputTypes, ignoredMessagePartTypes))
+		}
+		if err := unsupportedResponsesNoContentError(resp, droppedOutputTypes, ignoredMessagePartTypes, prevResponseSet); err != nil {
 			if c.logf != nil {
 				c.logf("openai_responses: %v", err)
 			}
@@ -557,30 +560,89 @@ func hasActionableResponsesContent(content []agent.MessageContent) bool {
 	return false
 }
 
-func unsupportedResponsesNoContentError(output []responses.ResponseOutputItemUnion, droppedOutputTypes, ignoredMessagePartTypes map[string]int, allowBenignEmptyOutputTextOnlyNoop bool) error {
-	if len(output) == 0 {
+func unsupportedResponsesNoContentError(resp *responses.Response, droppedOutputTypes, ignoredMessagePartTypes map[string]int, allowBenignEmptyOutputTextOnlyNoop bool) error {
+	if resp == nil {
 		return nil
 	}
-	if allowBenignEmptyOutputTextOnlyNoop && isBenignEmptyOutputTextOnlyNoop(output, droppedOutputTypes, ignoredMessagePartTypes) {
+	if len(resp.Output) == 0 {
 		return nil
+	}
+	if allowBenignEmptyOutputTextOnlyNoop && isBenignEmptyOutputTextOnlyNoop(resp.Output, droppedOutputTypes, ignoredMessagePartTypes) {
+		return nil
+	}
+	return fmt.Errorf("openai responses returned no supported actionable content (%s)", responsesNoContentDiagnosticsSummary(resp, droppedOutputTypes, ignoredMessagePartTypes))
+}
+
+func responsesNoContentDiagnosticsSummary(resp *responses.Response, droppedOutputTypes, ignoredMessagePartTypes map[string]int) string {
+	if resp == nil {
+		return "response=nil"
 	}
 	outputItemTypes := make(map[string]int)
-	for _, item := range output {
+	for _, item := range resp.Output {
 		typ := strings.TrimSpace(item.Type)
 		if typ == "" {
 			typ = "unknown"
 		}
 		outputItemTypes[typ]++
 	}
+	responseStatus := strings.TrimSpace(string(resp.Status))
+	if responseStatus == "" {
+		responseStatus = "unknown"
+	}
 	var details []string
+	details = append(details, fmt.Sprintf("response_status=%s", responseStatus))
+	if reason := strings.TrimSpace(resp.IncompleteDetails.Reason); reason != "" {
+		details = append(details, fmt.Sprintf("incomplete_reason=%s", reason))
+	}
+	if code := strings.TrimSpace(string(resp.Error.Code)); code != "" {
+		details = append(details, fmt.Sprintf("response_error_code=%s", code))
+	}
+	if msg := strings.TrimSpace(resp.Error.Message); msg != "" {
+		details = append(details, "response_error_message_present=true")
+	}
 	details = append(details, fmt.Sprintf("output_items=%s", formatTypeCountMap(outputItemTypes)))
+	if itemStatuses := responseOutputItemStatusCounts(resp.Output); len(itemStatuses) > 0 {
+		details = append(details, fmt.Sprintf("output_item_statuses=%s", formatTypeCountMap(itemStatuses)))
+	}
 	if len(ignoredMessagePartTypes) > 0 {
 		details = append(details, fmt.Sprintf("ignored_message_parts=%s", formatTypeCountMap(ignoredMessagePartTypes)))
 	}
 	if len(droppedOutputTypes) > 0 {
 		details = append(details, fmt.Sprintf("dropped_output_items=%s", formatTypeCountMap(droppedOutputTypes)))
 	}
-	return fmt.Errorf("openai responses returned no supported actionable content (%s)", strings.Join(details, " "))
+	return strings.Join(details, " ")
+}
+
+func responseOutputItemStatusCounts(output []responses.ResponseOutputItemUnion) map[string]int {
+	var counts map[string]int
+	for _, item := range output {
+		type itemMeta struct {
+			Type   string `json:"type"`
+			Status string `json:"status"`
+		}
+		typ := strings.TrimSpace(item.Type)
+		status := ""
+		if raw := strings.TrimSpace(item.RawJSON()); raw != "" {
+			var meta itemMeta
+			if err := json.Unmarshal([]byte(raw), &meta); err == nil {
+				if strings.TrimSpace(meta.Type) != "" {
+					typ = strings.TrimSpace(meta.Type)
+				}
+				status = strings.TrimSpace(meta.Status)
+			}
+		}
+		if typ == "" {
+			typ = "unknown"
+		}
+		if status == "" {
+			status = "none"
+		}
+		if counts == nil {
+			counts = map[string]int{}
+		}
+		counts[fmt.Sprintf("%s:%s", typ, status)]++
+	}
+	return counts
 }
 
 func isBenignEmptyOutputTextOnlyNoop(output []responses.ResponseOutputItemUnion, droppedOutputTypes, ignoredMessagePartTypes map[string]int) bool {

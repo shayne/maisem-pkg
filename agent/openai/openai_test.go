@@ -347,7 +347,10 @@ func TestResponseOutputToContentReportsIgnoredMessagePartTypesAndNoSupportedCont
 		t.Fatalf("ignored refusal part count = %d, want 1 (ignored=%v)", got, ignoredParts)
 	}
 
-	err := unsupportedResponsesNoContentError(output, dropped, ignoredParts, false)
+	err := unsupportedResponsesNoContentError(&responses.Response{
+		Status: responses.ResponseStatusCompleted,
+		Output: output,
+	}, dropped, ignoredParts, false)
 	if err == nil {
 		t.Fatalf("expected refusal-only output to produce a clear unsupported-content error")
 	}
@@ -381,11 +384,62 @@ func TestUnsupportedResponsesNoContentError_EmptyOutputTextOnlyRequiresContinuat
 		t.Fatalf("ignored empty output_text part count = %d, want 1 (ignored=%v)", got, ignoredParts)
 	}
 
-	if err := unsupportedResponsesNoContentError(output, dropped, ignoredParts, false); err == nil {
+	resp := responses.Response{
+		Status: responses.ResponseStatusCompleted,
+		Output: output,
+	}
+	if err := unsupportedResponsesNoContentError(&resp, dropped, ignoredParts, false); err == nil {
 		t.Fatalf("expected top-level empty output_text-only message to remain an error without continuation flag")
 	}
-	if err := unsupportedResponsesNoContentError(output, dropped, ignoredParts, true); err != nil {
+	if err := unsupportedResponsesNoContentError(&resp, dropped, ignoredParts, true); err != nil {
 		t.Fatalf("expected continuation empty output_text-only message to be treated as benign no-op, got error: %v", err)
+	}
+}
+
+func TestUnsupportedResponsesNoContentError_IncludesResponseStatusDiagnostics(t *testing.T) {
+	var resp responses.Response
+	if err := json.Unmarshal([]byte(`{
+		"id":"resp_test_1",
+		"object":"response",
+		"created_at":0,
+		"status":"completed",
+		"error": null,
+		"incomplete_details": null,
+		"instructions": null,
+		"metadata": {},
+		"model":"gpt-5.3-codex",
+		"output":[
+			{
+				"id":"msg_empty_2",
+				"type":"message",
+				"status":"completed",
+				"role":"assistant",
+				"content":[{"type":"output_text","text":"","annotations":[]}]
+			}
+		],
+		"parallel_tool_calls": true,
+		"temperature": 1,
+		"tool_choice":"auto",
+		"tools":[],
+		"top_p":1
+	}`), &resp); err != nil {
+		t.Fatalf("json.Unmarshal response: %v", err)
+	}
+
+	content, dropped, ignoredParts := responseOutputToContentWithUnhandled(resp.Output)
+	if got := len(content); got != 0 {
+		t.Fatalf("content item count = %d, want 0", got)
+	}
+
+	err := unsupportedResponsesNoContentError(&resp, dropped, ignoredParts, false)
+	if err == nil {
+		t.Fatalf("expected unsupported no-content error")
+	}
+	if !strings.Contains(err.Error(), "response_status=completed") {
+		t.Fatalf("error %q missing response_status diagnostics", err)
+	}
+	if !strings.Contains(err.Error(), "output_item_statuses=message:completed=1") {
+		t.Fatalf("error %q missing output_item_statuses diagnostics", err)
 	}
 }
 
