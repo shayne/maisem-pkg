@@ -225,6 +225,43 @@ func TestCreateMessagesWithResponses_EmptyOutputTextOnlyAfterRetryReturnsTypedEr
 	}
 }
 
+func TestCreateMessagesWithResponses_EmptyOutputTextOnlyAfterConfiguredRetryLimitReturnsTypedError(t *testing.T) {
+	t.Helper()
+
+	callCount := 0
+	c := &Client{
+		model: "gpt-5.3-codex",
+		responsesNewHook: func(ctx context.Context, params responses.ResponseNewParams) (*responses.Response, error) {
+			callCount++
+			return responseFromJSON(t, `{
+				"id":"resp_empty_cfg_repeat","object":"response","created_at":0,
+				"status":"completed","error":null,"incomplete_details":null,
+				"instructions":null,"metadata":{},"model":"gpt-5.3-codex",
+				"output":[{"id":"msg_empty_cfg_repeat","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"","annotations":[]}]}],
+				"parallel_tool_calls":true,"temperature":1,"tool_choice":"auto","tools":[],"top_p":1,
+				"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":1}
+			}`), nil
+		},
+	}
+	c.SetRetryEmptyCompletedMessageLimit(5)
+
+	_, err := c.createMessagesWithResponses(context.Background(), agent.MessagesRequest{
+		Messages: []agent.Message{{
+			Role:    agent.RoleUser,
+			Content: agent.Content{agent.NewTextContent("What is the capital of Ireland?")},
+		}},
+	})
+	if err == nil {
+		t.Fatalf("expected error after configured retry exhaustion")
+	}
+	if !errors.Is(err, ErrResponsesEmptyCompletedMessage) {
+		t.Fatalf("error %v is not ErrResponsesEmptyCompletedMessage", err)
+	}
+	if callCount != 6 {
+		t.Fatalf("responses.New calls = %d, want 6 after 5 configured retries", callCount)
+	}
+}
+
 func TestCreateMessagesWithResponses_DefaultDoesNotRetryTopLevelEmptyOutputTextOnly(t *testing.T) {
 	t.Helper()
 
