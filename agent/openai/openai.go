@@ -242,14 +242,20 @@ func (c *Client) createMessagesWithResponses(ctx context.Context, req agent.Mess
 		return agent.MessagesResponse{}, fmt.Errorf("%w: %s", agent.ErrTooLarge, resp.IncompleteDetails.Reason)
 	}
 
-	collectedContent, droppedOutputTypes := responseOutputToContentWithUnhandled(resp.Output)
+	collectedContent, droppedOutputTypes, ignoredMessagePartTypes := responseOutputToContentWithUnhandled(resp.Output)
 	if c.logf != nil && len(droppedOutputTypes) > 0 {
-		dropped := make([]string, 0, len(droppedOutputTypes))
-		for typ, count := range droppedOutputTypes {
-			dropped = append(dropped, fmt.Sprintf("%s=%d", typ, count))
+		c.logf("openai_responses: dropped_output_items=%s", formatTypeCountMap(droppedOutputTypes))
+	}
+	if c.logf != nil && len(ignoredMessagePartTypes) > 0 {
+		c.logf("openai_responses: ignored_message_parts=%s", formatTypeCountMap(ignoredMessagePartTypes))
+	}
+	if !hasActionableResponsesContent(collectedContent) {
+		if err := unsupportedResponsesNoContentError(resp.Output, droppedOutputTypes, ignoredMessagePartTypes); err != nil {
+			if c.logf != nil {
+				c.logf("openai_responses: %v", err)
+			}
+			return agent.MessagesResponse{}, err
 		}
-		sort.Strings(dropped)
-		c.logf("openai_responses: dropped_output_items=%s", strings.Join(dropped, ","))
 	}
 	responseUsage := agent.Usage{
 		InputTokens:  int(resp.Usage.InputTokens),
@@ -468,13 +474,14 @@ func contentToResponsesParts(content agent.Content) responses.ResponseInputMessa
 }
 
 func responseOutputToContent(output []responses.ResponseOutputItemUnion) []agent.MessageContent {
-	content, _ := responseOutputToContentWithUnhandled(output)
+	content, _, _ := responseOutputToContentWithUnhandled(output)
 	return content
 }
 
-func responseOutputToContentWithUnhandled(output []responses.ResponseOutputItemUnion) ([]agent.MessageContent, map[string]int) {
+func responseOutputToContentWithUnhandled(output []responses.ResponseOutputItemUnion) ([]agent.MessageContent, map[string]int, map[string]int) {
 	var out []agent.MessageContent
 	var dropped map[string]int
+	var ignoredMessageParts map[string]int
 	for _, item := range output {
 		switch item.Type {
 		case "message":
@@ -482,7 +489,19 @@ func responseOutputToContentWithUnhandled(output []responses.ResponseOutputItemU
 			for _, part := range msg.Content {
 				if part.Type == "output_text" && part.Text != "" {
 					out = append(out, agent.NewTextContent(part.Text))
+					continue
 				}
+				key := strings.TrimSpace(part.Type)
+				switch {
+				case key == "":
+					key = "unknown"
+				case key == "output_text" && strings.TrimSpace(part.Text) == "":
+					key = "output_text_empty"
+				}
+				if ignoredMessageParts == nil {
+					ignoredMessageParts = map[string]int{}
+				}
+				ignoredMessageParts[key]++
 			}
 		case "function_call":
 			call := item.AsFunctionCall()
@@ -515,7 +534,58 @@ func responseOutputToContentWithUnhandled(output []responses.ResponseOutputItemU
 			}
 		}
 	}
-	return out, dropped
+	return out, dropped, ignoredMessageParts
+}
+
+func hasActionableResponsesContent(content []agent.MessageContent) bool {
+	for _, c := range content {
+		switch c.Type {
+		case agent.ContentTypeText:
+			if strings.TrimSpace(c.Text) != "" {
+				return true
+			}
+		case agent.ContentTypeToolUse:
+			if c.ToolUse != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func unsupportedResponsesNoContentError(output []responses.ResponseOutputItemUnion, droppedOutputTypes, ignoredMessagePartTypes map[string]int) error {
+	if len(output) == 0 {
+		return nil
+	}
+	outputItemTypes := make(map[string]int)
+	for _, item := range output {
+		typ := strings.TrimSpace(item.Type)
+		if typ == "" {
+			typ = "unknown"
+		}
+		outputItemTypes[typ]++
+	}
+	var details []string
+	details = append(details, fmt.Sprintf("output_items=%s", formatTypeCountMap(outputItemTypes)))
+	if len(ignoredMessagePartTypes) > 0 {
+		details = append(details, fmt.Sprintf("ignored_message_parts=%s", formatTypeCountMap(ignoredMessagePartTypes)))
+	}
+	if len(droppedOutputTypes) > 0 {
+		details = append(details, fmt.Sprintf("dropped_output_items=%s", formatTypeCountMap(droppedOutputTypes)))
+	}
+	return fmt.Errorf("openai responses returned no supported actionable content (%s)", strings.Join(details, " "))
+}
+
+func formatTypeCountMap(m map[string]int) string {
+	if len(m) == 0 {
+		return "none"
+	}
+	parts := make([]string, 0, len(m))
+	for typ, count := range m {
+		parts = append(parts, fmt.Sprintf("%s=%d", typ, count))
+	}
+	sort.Strings(parts)
+	return strings.Join(parts, ",")
 }
 
 func responsesRequestStateMode(req agent.MessagesRequest) string {

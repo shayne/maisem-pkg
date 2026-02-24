@@ -307,7 +307,7 @@ func TestResponseOutputToContentReportsUnhandledItemTypes(t *testing.T) {
 		t.Fatalf("json.Unmarshal output items: %v", err)
 	}
 
-	content, dropped := responseOutputToContentWithUnhandled(output)
+	content, dropped, ignoredParts := responseOutputToContentWithUnhandled(output)
 	if got := len(content); got != 1 {
 		t.Fatalf("content item count = %d, want 1", got)
 	}
@@ -316,6 +316,43 @@ func TestResponseOutputToContentReportsUnhandledItemTypes(t *testing.T) {
 	}
 	if got := dropped["custom_tool_call"]; got != 1 {
 		t.Fatalf("dropped custom_tool_call count = %d, want 1 (dropped=%v)", got, dropped)
+	}
+	if len(ignoredParts) != 0 {
+		t.Fatalf("ignored message parts = %v, want none", ignoredParts)
+	}
+}
+
+func TestResponseOutputToContentReportsIgnoredMessagePartTypesAndNoSupportedContent(t *testing.T) {
+	var output []responses.ResponseOutputItemUnion
+	if err := json.Unmarshal([]byte(`[
+		{
+			"id":"msg_refusal_1",
+			"type":"message",
+			"status":"completed",
+			"role":"assistant",
+			"content":[{"type":"refusal","refusal":"I can’t help with that."}]
+		}
+	]`), &output); err != nil {
+		t.Fatalf("json.Unmarshal output items: %v", err)
+	}
+
+	content, dropped, ignoredParts := responseOutputToContentWithUnhandled(output)
+	if got := len(content); got != 0 {
+		t.Fatalf("content item count = %d, want 0 for refusal-only message", got)
+	}
+	if len(dropped) != 0 {
+		t.Fatalf("dropped output item types = %v, want none", dropped)
+	}
+	if got := ignoredParts["refusal"]; got != 1 {
+		t.Fatalf("ignored refusal part count = %d, want 1 (ignored=%v)", got, ignoredParts)
+	}
+
+	err := unsupportedResponsesNoContentError(output, dropped, ignoredParts)
+	if err == nil {
+		t.Fatalf("expected refusal-only output to produce a clear unsupported-content error")
+	}
+	if !strings.Contains(err.Error(), "ignored_message_parts=refusal=1") {
+		t.Fatalf("error %q missing ignored refusal part summary", err)
 	}
 }
 
