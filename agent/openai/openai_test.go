@@ -322,7 +322,7 @@ func TestResponseOutputToContentReportsUnhandledItemTypes(t *testing.T) {
 	}
 }
 
-func TestResponseOutputToContentReportsIgnoredMessagePartTypesAndNoSupportedContent(t *testing.T) {
+func TestResponseOutputToContentConvertsRefusalMessagePartToText(t *testing.T) {
 	var output []responses.ResponseOutputItemUnion
 	if err := json.Unmarshal([]byte(`[
 		{
@@ -337,25 +337,20 @@ func TestResponseOutputToContentReportsIgnoredMessagePartTypesAndNoSupportedCont
 	}
 
 	content, dropped, ignoredParts := responseOutputToContentWithUnhandled(output)
-	if got := len(content); got != 0 {
-		t.Fatalf("content item count = %d, want 0 for refusal-only message", got)
+	if got := len(content); got != 1 {
+		t.Fatalf("content item count = %d, want 1 for refusal-only message", got)
+	}
+	if content[0].Type != agent.ContentTypeText {
+		t.Fatalf("content[0].Type = %q, want text", content[0].Type)
+	}
+	if content[0].Text != "I can’t help with that." {
+		t.Fatalf("content[0].Text = %q, want refusal text", content[0].Text)
 	}
 	if len(dropped) != 0 {
 		t.Fatalf("dropped output item types = %v, want none", dropped)
 	}
-	if got := ignoredParts["refusal"]; got != 1 {
-		t.Fatalf("ignored refusal part count = %d, want 1 (ignored=%v)", got, ignoredParts)
-	}
-
-	err := unsupportedResponsesNoContentError(&responses.Response{
-		Status: responses.ResponseStatusCompleted,
-		Output: output,
-	}, dropped, ignoredParts, false)
-	if err == nil {
-		t.Fatalf("expected refusal-only output to produce a clear unsupported-content error")
-	}
-	if !strings.Contains(err.Error(), "ignored_message_parts=refusal=1") {
-		t.Fatalf("error %q missing ignored refusal part summary", err)
+	if len(ignoredParts) != 0 {
+		t.Fatalf("ignored message parts = %v, want none", ignoredParts)
 	}
 }
 

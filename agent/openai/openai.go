@@ -498,12 +498,18 @@ func responseOutputToContentWithUnhandled(output []responses.ResponseOutputItemU
 					out = append(out, agent.NewTextContent(part.Text))
 					continue
 				}
+				if part.Type == "refusal" && strings.TrimSpace(part.Refusal) != "" {
+					out = append(out, agent.NewTextContent(part.Refusal))
+					continue
+				}
 				key := strings.TrimSpace(part.Type)
 				switch {
 				case key == "":
 					key = "unknown"
 				case key == "output_text" && strings.TrimSpace(part.Text) == "":
 					key = "output_text_empty"
+				case key == "refusal" && strings.TrimSpace(part.Refusal) == "":
+					key = "refusal_empty"
 				}
 				if ignoredMessageParts == nil {
 					ignoredMessageParts = map[string]int{}
