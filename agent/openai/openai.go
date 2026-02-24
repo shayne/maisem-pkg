@@ -24,10 +24,12 @@ import (
 type Client struct {
 	client *openai.Client
 	model  string
+	logf   func(string, ...any)
 }
 
 var _ agent.LLMClient = (*Client)(nil)
 var _ agent.TokenCounter = (*Client)(nil)
+var _ agent.PreviousResponseIDSupport = (*Client)(nil)
 
 // New creates a new Client
 func New(apiKey, model string) *Client {
@@ -44,6 +46,17 @@ func NewWithOptions(model string, opts ...option.RequestOption) *Client {
 // SetModel sets the model for the client
 func (c *Client) SetModel(model string) {
 	c.model = model
+}
+
+// SetLogf installs an optional logger used for debug/observability messages.
+func (c *Client) SetLogf(logf func(string, ...any)) {
+	c.logf = logf
+}
+
+// SupportsPreviousResponseID reports whether this model is using the Responses API
+// and can continue a conversation via previous_response_id.
+func (c *Client) SupportsPreviousResponseID() bool {
+	return usesResponsesAPI(c.model)
 }
 
 // CountTokens estimates the number of tokens in a request.
@@ -209,6 +222,14 @@ func (c *Client) CreateMessages(ctx context.Context, req agent.MessagesRequest, 
 
 func (c *Client) createMessagesWithResponses(ctx context.Context, req agent.MessagesRequest) (agent.MessagesResponse, error) {
 	params := c.buildResponsesParams(req)
+	if c.logf != nil {
+		c.logf(
+			"openai_responses: request_state_mode=%s messages=%d prev_response_set=%t",
+			responsesRequestStateMode(req),
+			len(req.Messages),
+			req.ConversationState != nil && strings.TrimSpace(req.ConversationState.PreviousResponseID) != "",
+		)
+	}
 
 	start := time.Now()
 	resp, err := c.client.Responses.New(ctx, params)
@@ -221,7 +242,15 @@ func (c *Client) createMessagesWithResponses(ctx context.Context, req agent.Mess
 		return agent.MessagesResponse{}, fmt.Errorf("%w: %s", agent.ErrTooLarge, resp.IncompleteDetails.Reason)
 	}
 
-	collectedContent := responseOutputToContent(resp.Output)
+	collectedContent, droppedOutputTypes := responseOutputToContentWithUnhandled(resp.Output)
+	if c.logf != nil && len(droppedOutputTypes) > 0 {
+		dropped := make([]string, 0, len(droppedOutputTypes))
+		for typ, count := range droppedOutputTypes {
+			dropped = append(dropped, fmt.Sprintf("%s=%d", typ, count))
+		}
+		sort.Strings(dropped)
+		c.logf("openai_responses: dropped_output_items=%s", strings.Join(dropped, ","))
+	}
 	responseUsage := agent.Usage{
 		InputTokens:  int(resp.Usage.InputTokens),
 		OutputTokens: int(resp.Usage.OutputTokens),
@@ -439,7 +468,13 @@ func contentToResponsesParts(content agent.Content) responses.ResponseInputMessa
 }
 
 func responseOutputToContent(output []responses.ResponseOutputItemUnion) []agent.MessageContent {
+	content, _ := responseOutputToContentWithUnhandled(output)
+	return content
+}
+
+func responseOutputToContentWithUnhandled(output []responses.ResponseOutputItemUnion) ([]agent.MessageContent, map[string]int) {
 	var out []agent.MessageContent
+	var dropped map[string]int
 	for _, item := range output {
 		switch item.Type {
 		case "message":
@@ -471,9 +506,28 @@ func responseOutputToContent(output []responses.ResponseOutputItemUnion) []agent
 					RedactedThinking: encodeResponsesReasoningReplayItem(raw),
 				})
 			}
+		default:
+			if item.Type != "" {
+				if dropped == nil {
+					dropped = map[string]int{}
+				}
+				dropped[item.Type]++
+			}
 		}
 	}
-	return out
+	return out, dropped
+}
+
+func responsesRequestStateMode(req agent.MessagesRequest) string {
+	prevSet := req.ConversationState != nil && strings.TrimSpace(req.ConversationState.PreviousResponseID) != ""
+	switch {
+	case prevSet:
+		return "previous_response_id_continuation"
+	case len(req.Messages) > 0:
+		return "manual_replay"
+	default:
+		return "stateless_empty"
+	}
 }
 
 const responsesReasoningReplayPrefix = "openai_responses_reasoning:"

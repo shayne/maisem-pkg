@@ -325,6 +325,12 @@ type TokenCounter interface {
 	CountTokens(ctx context.Context, req MessagesRequest) (int, error)
 }
 
+// PreviousResponseIDSupport is an optional interface for clients that can
+// continue a conversation using a provider response ID plus delta input.
+type PreviousResponseIDSupport interface {
+	SupportsPreviousResponseID() bool
+}
+
 // ConversationState carries provider-agnostic continuation state for a conversation.
 // Providers that support response chaining can use this data to continue from a prior response.
 type ConversationState struct {
@@ -828,6 +834,12 @@ func (a *Agent) Loop(ctx context.Context, messages []Message, interjections func
 	}
 	curIter := 0
 	var lastResponse *MessagesResponse
+	supportsPreviousResponseID := false
+	if ps, ok := a.opts.Client.(PreviousResponseIDSupport); ok {
+		supportsPreviousResponseID = ps.SupportsPreviousResponseID()
+	}
+	var nextConversationState *ConversationState
+	nextDeltaStart := 0
 	for shouldLoop := true; shouldLoop; {
 		if ctx.Err() != nil {
 			return lastResponse, ctx.Err()
@@ -842,6 +854,12 @@ func (a *Agent) Loop(ctx context.Context, messages []Message, interjections func
 		if len(msgs) == 0 {
 			return lastResponse, fmt.Errorf("no messages to generate")
 		}
+		requestMessages := msgs
+		requestConversationState := (*ConversationState)(nil)
+		if nextConversationState != nil && nextDeltaStart >= 0 && nextDeltaStart <= len(msgs) {
+			requestMessages = msgs[nextDeltaStart:]
+			requestConversationState = nextConversationState
+		}
 		var setCacheControlOnMessage *Message
 		x := &msgs[len(msgs)-1]
 		if lc := len(x.Content); lc > 0 {
@@ -851,7 +869,7 @@ func (a *Agent) Loop(ctx context.Context, messages []Message, interjections func
 			setCacheControlOnMessage = x
 		}
 		tools := a.getTools()
-		mr, genErr := a.generate(ctx, msgs, tools)
+		mr, genErr := a.generate(ctx, requestMessages, tools, requestConversationState)
 		if mr != nil {
 			lastResponse = mr
 			msgs = append(msgs, Message{
@@ -873,6 +891,14 @@ func (a *Agent) Loop(ctx context.Context, messages []Message, interjections func
 		}
 		if toolResponse != nil {
 			msgs = append(msgs, *toolResponse)
+		}
+		nextConversationState = nil
+		nextDeltaStart = 0
+		if toolResponse != nil && supportsPreviousResponseID && mr != nil {
+			if previousResponseID := strings.TrimSpace(mr.ID); previousResponseID != "" {
+				nextConversationState = &ConversationState{PreviousResponseID: previousResponseID}
+				nextDeltaStart = len(msgs) - 1 // replay only the new tool output (plus any next interjections)
+			}
 		}
 		if stopExecErr != nil {
 			a.opts.Logf("Tool execution error: %v", stopExecErr)
@@ -897,7 +923,7 @@ const maxGenerateTries = 3
 //
 // It attempts to generate a response up to [maxGenerateTries] times, with a backoff
 // between attempts.
-func (a *Agent) generate(ctx context.Context, history []Message, tools map[string]*Tool) (*MessagesResponse, error) {
+func (a *Agent) generate(ctx context.Context, history []Message, tools map[string]*Tool, conversationState *ConversationState) (*MessagesResponse, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	mr := MessagesRequest{
@@ -907,6 +933,12 @@ func (a *Agent) generate(ctx context.Context, history []Message, tools map[strin
 		ThinkingMode:   true,
 		ThinkingTokens: a.opts.ThinkingTokens,
 		Messages:       history,
+		ConversationState: func() *ConversationState {
+			if conversationState == nil {
+				return nil
+			}
+			return &ConversationState{PreviousResponseID: strings.TrimSpace(conversationState.PreviousResponseID)}
+		}(),
 	}
 	// Anthropic will throw an error if ToolChoice is set to "auto" and there are no tools.
 	if len(tools) > 0 {

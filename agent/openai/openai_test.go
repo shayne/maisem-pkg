@@ -239,6 +239,86 @@ func TestUsesResponsesAPI_CodexModels(t *testing.T) {
 	}
 }
 
+func TestClientSupportsPreviousResponseID(t *testing.T) {
+	if !(&Client{model: "gpt-5.3-codex"}).SupportsPreviousResponseID() {
+		t.Fatalf("expected codex/responses model to support previous_response_id")
+	}
+	if (&Client{model: "gpt-4.1"}).SupportsPreviousResponseID() {
+		t.Fatalf("expected chat-completions model to not support previous_response_id continuation")
+	}
+}
+
+func TestResponsesRequestStateMode(t *testing.T) {
+	tests := []struct {
+		name string
+		req  agent.MessagesRequest
+		want string
+	}{
+		{
+			name: "manual replay",
+			req: agent.MessagesRequest{
+				Messages: []agent.Message{{Role: agent.RoleUser, Content: agent.Content{agent.NewTextContent("hi")}}},
+			},
+			want: "manual_replay",
+		},
+		{
+			name: "previous response continuation with delta input",
+			req: agent.MessagesRequest{
+				ConversationState: &agent.ConversationState{PreviousResponseID: "resp_1"},
+				Messages:          []agent.Message{{Role: agent.RoleUser, Content: agent.Content{agent.NewTextContent("next")}}},
+			},
+			want: "previous_response_id_continuation",
+		},
+		{
+			name: "empty stateless request",
+			req:  agent.MessagesRequest{},
+			want: "stateless_empty",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := responsesRequestStateMode(tt.req); got != tt.want {
+				t.Fatalf("responsesRequestStateMode() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestResponseOutputToContentReportsUnhandledItemTypes(t *testing.T) {
+	var output []responses.ResponseOutputItemUnion
+	if err := json.Unmarshal([]byte(`[
+		{
+			"id":"ctc_123",
+			"type":"custom_tool_call",
+			"status":"completed",
+			"call_id":"call_custom_1",
+			"input":"echo hello",
+			"name":"shell_exec"
+		},
+		{
+			"id":"msg_123",
+			"type":"message",
+			"status":"completed",
+			"role":"assistant",
+			"content":[{"type":"output_text","text":"done","annotations":[]}]
+		}
+	]`), &output); err != nil {
+		t.Fatalf("json.Unmarshal output items: %v", err)
+	}
+
+	content, dropped := responseOutputToContentWithUnhandled(output)
+	if got := len(content); got != 1 {
+		t.Fatalf("content item count = %d, want 1", got)
+	}
+	if content[0].Type != agent.ContentTypeText || content[0].Text != "done" {
+		t.Fatalf("content[0] = %#v, want assistant text", content[0])
+	}
+	if got := dropped["custom_tool_call"]; got != 1 {
+		t.Fatalf("dropped custom_tool_call count = %d, want 1 (dropped=%v)", got, dropped)
+	}
+}
+
 func TestConvertToResponsesInput_AssistantTextUsesOutputText(t *testing.T) {
 	input := convertToResponsesInput([]agent.Message{
 		{

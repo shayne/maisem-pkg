@@ -582,3 +582,106 @@ func TestLoopMaxToolIterationsCheckedBeforeGeneration(t *testing.T) {
 		t.Error("expected last response from completed iterations")
 	}
 }
+
+type continuationAwareTestClient struct {
+	reqs  []MessagesRequest
+	calls int
+}
+
+func (c *continuationAwareTestClient) SupportsPreviousResponseID() bool { return true }
+
+func (c *continuationAwareTestClient) CreateMessages(ctx context.Context, req MessagesRequest, onUpdate func(MessagesResponse)) (MessagesResponse, error) {
+	c.reqs = append(c.reqs, req)
+	c.calls++
+	switch c.calls {
+	case 1:
+		return MessagesResponse{
+			ID:         "resp_1",
+			StopReason: "tool_use",
+			Content: Content{
+				NewToolUseContent("call_1", "echo_tool", json.RawMessage(`{"text":"hello"}`)),
+			},
+		}, nil
+	case 2:
+		return MessagesResponse{
+			ID:         "resp_2",
+			StopReason: "end_turn",
+			Content: Content{
+				NewTextContent("done"),
+			},
+		}, nil
+	default:
+		return MessagesResponse{}, errors.New("unexpected extra call")
+	}
+}
+
+func TestLoopUsesPreviousResponseIDDeltaContinuationBetweenToolIterations(t *testing.T) {
+	t.Parallel()
+
+	client := &continuationAwareTestClient{}
+	ag, err := New(Opts{
+		SystemPrompt: "test",
+		Client:       client,
+		ToolProvider: func() []*Tool {
+			return []*Tool{
+				NewTool("echo_tool", "Echoes text", func(ctx context.Context, args struct {
+					Text string `json:"text"`
+				}) (string, []MessageContent, error) {
+					return "ok:" + args.Text, nil, nil
+				}),
+			}
+		},
+		Logf: func(string, ...any) {},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	resp, err := ag.Loop(context.Background(), []Message{{
+		Role:    RoleUser,
+		Content: Content{NewTextContent("run the tool")},
+	}}, nil)
+	if err != nil {
+		t.Fatalf("Loop: %v", err)
+	}
+	if resp == nil {
+		t.Fatalf("resp = nil")
+	}
+	if got := resp.Content.LossyText(); got != "done" {
+		t.Fatalf("final text = %q, want %q", got, "done")
+	}
+	if got := len(client.reqs); got != 2 {
+		t.Fatalf("request count = %d, want 2", got)
+	}
+
+	first := client.reqs[0]
+	if first.ConversationState != nil && first.ConversationState.PreviousResponseID != "" {
+		t.Fatalf("first request previous_response_id = %q, want empty", first.ConversationState.PreviousResponseID)
+	}
+	if got := len(first.Messages); got != 1 {
+		t.Fatalf("first request message count = %d, want 1", got)
+	}
+
+	second := client.reqs[1]
+	if second.ConversationState == nil {
+		t.Fatalf("second request ConversationState = nil, want previous_response_id")
+	}
+	if got := second.ConversationState.PreviousResponseID; got != "resp_1" {
+		t.Fatalf("second request previous_response_id = %q, want %q", got, "resp_1")
+	}
+	if got := len(second.Messages); got != 1 {
+		t.Fatalf("second request should replay delta only, got %d messages", got)
+	}
+	if second.Messages[0].Role != RoleTool {
+		t.Fatalf("second request delta role = %q, want tool output message", second.Messages[0].Role)
+	}
+	if got := len(second.Messages[0].Content); got != 1 {
+		t.Fatalf("second request delta content count = %d, want 1", got)
+	}
+	if second.Messages[0].Content[0].Type != ContentTypeToolResult || second.Messages[0].Content[0].ToolResults == nil {
+		t.Fatalf("second request delta content = %#v, want tool_result", second.Messages[0].Content[0])
+	}
+	if got := second.Messages[0].Content[0].ToolResults.ToolCallID; got != "call_1" {
+		t.Fatalf("second request tool_result call id = %q, want %q", got, "call_1")
+	}
+}
