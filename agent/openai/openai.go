@@ -25,10 +25,11 @@ type Client struct {
 	client *openai.Client
 	model  string
 	logf   func(string, ...any)
-	// retryEmptyCompletedMessageOnce enables one automatic retry for top-level
+	// retryEmptyCompletedMessageLimit controls how many automatic retries are
+	// allowed for top-level
 	// Responses calls that return a completed assistant message with only empty
 	// output_text parts.
-	retryEmptyCompletedMessageOnce bool
+	retryEmptyCompletedMessageLimit int
 
 	// responsesNewHook is used in tests to stub Responses API calls.
 	responsesNewHook func(context.Context, responses.ResponseNewParams) (*responses.Response, error)
@@ -67,8 +68,23 @@ func (c *Client) SetLogf(logf func(string, ...any)) {
 // SetRetryEmptyCompletedMessageOnce controls whether the client retries once
 // when the Responses API returns a completed assistant message with no
 // actionable content and only empty output_text parts on a top-level turn.
+// Deprecated: prefer SetRetryEmptyCompletedMessageLimit.
 func (c *Client) SetRetryEmptyCompletedMessageOnce(v bool) {
-	c.retryEmptyCompletedMessageOnce = v
+	if v {
+		c.retryEmptyCompletedMessageLimit = 1
+		return
+	}
+	c.retryEmptyCompletedMessageLimit = 0
+}
+
+// SetRetryEmptyCompletedMessageLimit controls how many times the client retries
+// a top-level Responses call when it returns a completed assistant message with
+// no actionable content and only empty output_text parts.
+func (c *Client) SetRetryEmptyCompletedMessageLimit(limit int) {
+	if limit < 0 {
+		limit = 0
+	}
+	c.retryEmptyCompletedMessageLimit = limit
 }
 
 // SupportsPreviousResponseID reports whether this model is using the Responses API
@@ -257,7 +273,7 @@ func (c *Client) createMessagesWithResponses(ctx context.Context, req agent.Mess
 		collectedContent        []agent.MessageContent
 		droppedOutputTypes      map[string]int
 		ignoredMessagePartTypes map[string]int
-		emptyOutputRetryUsed    bool
+		emptyOutputRetryCount   int
 	)
 	for {
 		start := time.Now()
@@ -283,16 +299,16 @@ func (c *Client) createMessagesWithResponses(ctx context.Context, req agent.Mess
 			if c.logf != nil {
 				c.logf("openai_responses: no_actionable_content_details=%s", diagnostics)
 			}
-			if shouldRetryTopLevelEmptyOutputTextOnlyNoActionable(c.retryEmptyCompletedMessageOnce, prevResponseSet, req, resp, droppedOutputTypes, ignoredMessagePartTypes, emptyOutputRetryUsed) {
-				emptyOutputRetryUsed = true
+			if shouldRetryTopLevelEmptyOutputTextOnlyNoActionable(c.retryEmptyCompletedMessageLimit, prevResponseSet, req, resp, droppedOutputTypes, ignoredMessagePartTypes, emptyOutputRetryCount) {
+				emptyOutputRetryCount++
 				if c.logf != nil {
-					c.logf("openai_responses: retry_triggered reason=top_level_empty_output_text_only attempt=1")
+					c.logf("openai_responses: retry_triggered reason=top_level_empty_output_text_only attempt=%d", emptyOutputRetryCount)
 				}
 				continue
 			}
 			if err := unsupportedResponsesNoContentError(resp, droppedOutputTypes, ignoredMessagePartTypes, prevResponseSet); err != nil {
 				if c.logf != nil {
-					if emptyOutputRetryUsed && errors.Is(err, ErrResponsesEmptyCompletedMessage) {
+					if emptyOutputRetryCount > 0 && errors.Is(err, ErrResponsesEmptyCompletedMessage) {
 						c.logf("openai_responses: retry_outcome=failed reason=top_level_empty_output_text_only")
 					}
 					c.logf("openai_responses: %v", err)
@@ -303,7 +319,7 @@ func (c *Client) createMessagesWithResponses(ctx context.Context, req agent.Mess
 				c.logf("openai_responses: no_actionable_content treated_as=noop reason=output_text_empty_only")
 			}
 		}
-		if emptyOutputRetryUsed && c.logf != nil {
+		if emptyOutputRetryCount > 0 && c.logf != nil {
 			c.logf("openai_responses: retry_outcome=success reason=top_level_empty_output_text_only")
 		}
 		break
@@ -705,8 +721,8 @@ func responseOutputItemStatusCounts(output []responses.ResponseOutputItemUnion) 
 	return counts
 }
 
-func shouldRetryTopLevelEmptyOutputTextOnlyNoActionable(retryEnabled, prevResponseSet bool, req agent.MessagesRequest, resp *responses.Response, droppedOutputTypes, ignoredMessagePartTypes map[string]int, retryUsed bool) bool {
-	if !retryEnabled || retryUsed || prevResponseSet || resp == nil {
+func shouldRetryTopLevelEmptyOutputTextOnlyNoActionable(retryLimit int, prevResponseSet bool, req agent.MessagesRequest, resp *responses.Response, droppedOutputTypes, ignoredMessagePartTypes map[string]int, retryCount int) bool {
+	if retryLimit <= 0 || retryCount >= retryLimit || prevResponseSet || resp == nil {
 		return false
 	}
 	if len(req.Messages) == 0 {

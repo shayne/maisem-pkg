@@ -97,6 +97,57 @@ func TestCreateMessagesWithResponses_RetriesTopLevelEmptyOutputTextOnlyOnce(t *t
 	}
 }
 
+func TestCreateMessagesWithResponses_RetriesTopLevelEmptyOutputTextOnlyUpToConfiguredLimit(t *testing.T) {
+	t.Helper()
+
+	callCount := 0
+	c := &Client{
+		model: "gpt-5.3-codex",
+		responsesNewHook: func(ctx context.Context, params responses.ResponseNewParams) (*responses.Response, error) {
+			callCount++
+			if callCount <= 5 {
+				return responseFromJSON(t, `{
+					"id":"resp_empty_cfg","object":"response","created_at":0,
+					"status":"completed","error":null,"incomplete_details":null,
+					"instructions":null,"metadata":{},"model":"gpt-5.3-codex",
+					"output":[{"id":"msg_cfg_empty","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"","annotations":[]}]}],
+					"parallel_tool_calls":true,"temperature":1,"tool_choice":"auto","tools":[],"top_p":1,
+					"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":0,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":1}
+				}`), nil
+			}
+			if callCount == 6 {
+				return responseFromJSON(t, `{
+					"id":"resp_cfg_ok","object":"response","created_at":0,
+					"status":"completed","error":null,"incomplete_details":null,
+					"instructions":null,"metadata":{},"model":"gpt-5.3-codex",
+					"output":[{"id":"msg_cfg_ok","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"Dublin.","annotations":[]}]}],
+					"parallel_tool_calls":true,"temperature":1,"tool_choice":"auto","tools":[],"top_p":1,
+					"usage":{"input_tokens":1,"input_tokens_details":{"cached_tokens":0},"output_tokens":1,"output_tokens_details":{"reasoning_tokens":0},"total_tokens":2}
+				}`), nil
+			}
+			t.Fatalf("unexpected responses.New call %d", callCount)
+			return nil, nil
+		},
+	}
+	c.SetRetryEmptyCompletedMessageLimit(5)
+
+	resp, err := c.createMessagesWithResponses(context.Background(), agent.MessagesRequest{
+		Messages: []agent.Message{{
+			Role:    agent.RoleUser,
+			Content: agent.Content{agent.NewTextContent("What is the capital of Ireland?")},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("createMessagesWithResponses error: %v", err)
+	}
+	if callCount != 6 {
+		t.Fatalf("responses.New calls = %d, want 6 (1 initial + 5 retries)", callCount)
+	}
+	if got := resp.Content.LossyText(); got != "Dublin." {
+		t.Fatalf("response text = %q, want Dublin.", got)
+	}
+}
+
 func TestCreateMessagesWithResponses_DoesNotRetryContinuationEmptyOutputTextOnlyNoop(t *testing.T) {
 	t.Helper()
 
