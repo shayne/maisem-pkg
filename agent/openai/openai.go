@@ -394,6 +394,11 @@ func assistantMessageToResponsesItems(content agent.Content, nextMessageID int) 
 					Text: c.Text,
 				},
 			})
+		case agent.ContentTypeRedactedThinking:
+			if reasoningItem, ok := decodeResponsesReasoningReplayItem(c.RedactedThinking); ok {
+				flushText()
+				out = append(out, reasoningItem)
+			}
 		case agent.ContentTypeToolUse:
 			if c.ToolUse == nil {
 				continue
@@ -458,9 +463,39 @@ func responseOutputToContent(output []responses.ResponseOutputItemUnion) []agent
 					Input: normalizeToolCallArguments(call.Arguments),
 				},
 			})
+		case "reasoning":
+			reasoning := item.AsReasoning()
+			if raw := strings.TrimSpace(reasoning.RawJSON()); raw != "" {
+				out = append(out, agent.MessageContent{
+					Type:             agent.ContentTypeRedactedThinking,
+					RedactedThinking: encodeResponsesReasoningReplayItem(raw),
+				})
+			}
 		}
 	}
 	return out
+}
+
+const responsesReasoningReplayPrefix = "openai_responses_reasoning:"
+
+func encodeResponsesReasoningReplayItem(raw string) string {
+	return responsesReasoningReplayPrefix + raw
+}
+
+func decodeResponsesReasoningReplayItem(v string) (responses.ResponseInputItemUnionParam, bool) {
+	if !strings.HasPrefix(v, responsesReasoningReplayPrefix) {
+		return responses.ResponseInputItemUnionParam{}, false
+	}
+	raw := strings.TrimSpace(strings.TrimPrefix(v, responsesReasoningReplayPrefix))
+	if raw == "" {
+		return responses.ResponseInputItemUnionParam{}, false
+	}
+	var reasoning responses.ResponseReasoningItem
+	if err := json.Unmarshal([]byte(raw), &reasoning); err != nil {
+		return responses.ResponseInputItemUnionParam{}, false
+	}
+	p := reasoning.ToParam()
+	return responses.ResponseInputItemUnionParam{OfReasoning: &p}, true
 }
 
 type streamedToolCall struct {

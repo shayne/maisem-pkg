@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/openai/openai-go"
+	"github.com/openai/openai-go/responses"
 	"pkg.maisem.dev/agent"
 )
 
@@ -307,5 +308,64 @@ func TestConvertToResponsesInput_AssistantIDsAreUnique(t *testing.T) {
 	}
 	if !strings.HasPrefix(firstID, "msg") || !strings.HasPrefix(secondID, "msg") {
 		t.Fatalf("assistant message IDs must start with msg, got %q and %q", firstID, secondID)
+	}
+}
+
+func TestResponsesReasoningItemsArePreservedForManualReplay(t *testing.T) {
+	var output []responses.ResponseOutputItemUnion
+	if err := json.Unmarshal([]byte(`[
+		{
+			"id":"rs_123",
+			"type":"reasoning",
+			"summary":[{"type":"summary_text","text":"Need weather data first."}],
+			"status":"completed"
+		},
+		{
+			"id":"fc_123",
+			"type":"function_call",
+			"call_id":"call_weather_1",
+			"name":"get_weather",
+			"arguments":"{\"location\":\"Dublin\"}",
+			"status":"completed"
+		}
+	]`), &output); err != nil {
+		t.Fatalf("json.Unmarshal output items: %v", err)
+	}
+
+	content := responseOutputToContent(output)
+	if len(content) != 2 {
+		t.Fatalf("expected reasoning + tool_use to be preserved, got %d items: %#v", len(content), content)
+	}
+	if content[0].Type != agent.ContentTypeRedactedThinking {
+		t.Fatalf("expected first item to preserve reasoning as redacted_thinking passthrough, got %q", content[0].Type)
+	}
+	if content[1].Type != agent.ContentTypeToolUse || content[1].ToolUse == nil {
+		t.Fatalf("expected second item to be tool_use, got %#v", content[1])
+	}
+
+	input := convertToResponsesInput([]agent.Message{{
+		Role:    agent.RoleAssistant,
+		Content: content,
+	}})
+	raw, err := json.Marshal(input)
+	if err != nil {
+		t.Fatalf("json.Marshal: %v", err)
+	}
+
+	var items []map[string]any
+	if err := json.Unmarshal(raw, &items); err != nil {
+		t.Fatalf("json.Unmarshal replay items: %v", err)
+	}
+	if len(items) != 2 {
+		t.Fatalf("expected replay to include reasoning + function_call items, got %d (%s)", len(items), string(raw))
+	}
+	if got := items[0]["type"]; got != "reasoning" {
+		t.Fatalf("expected first replay item type=reasoning, got %v (%s)", got, string(raw))
+	}
+	if got := items[1]["type"]; got != "function_call" {
+		t.Fatalf("expected second replay item type=function_call, got %v (%s)", got, string(raw))
+	}
+	if got := items[0]["id"]; got != "rs_123" {
+		t.Fatalf("expected reasoning item id to round-trip, got %v (%s)", got, string(raw))
 	}
 }
