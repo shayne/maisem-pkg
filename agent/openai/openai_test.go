@@ -5,6 +5,7 @@
 package openai
 
 import (
+	"context"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -27,6 +28,11 @@ func paramsAsMap(t *testing.T, params any) map[string]any {
 		t.Fatalf("json.Unmarshal: %v", err)
 	}
 	return out
+}
+
+type loopClient struct {
+	t     *testing.T
+	calls int
 }
 
 func TestBuildChatCompletionParams_GPT5FamilyUsesMaxCompletionTokens(t *testing.T) {
@@ -367,5 +373,119 @@ func TestResponsesReasoningItemsArePreservedForManualReplay(t *testing.T) {
 	}
 	if got := items[0]["id"]; got != "rs_123" {
 		t.Fatalf("expected reasoning item id to round-trip, got %v (%s)", got, string(raw))
+	}
+}
+
+func TestAgentLoopPreservesResponsesReasoningItemsAcrossToolIteration(t *testing.T) {
+	t.Helper()
+
+	var client loopClient
+	client.t = t
+
+	ag, err := agent.New(agent.Opts{
+		SystemPrompt: "test",
+		Client:       &client,
+		ToolProvider: func() []*agent.Tool {
+			return []*agent.Tool{
+				agent.NewTool("get_weather", "Get weather", func(ctx context.Context, args struct {
+					Location string `json:"location"`
+				}) (string, []agent.MessageContent, error) {
+					return "sunny", nil, nil
+				}),
+			}
+		},
+		Logf: func(string, ...any) {},
+	})
+	if err != nil {
+		t.Fatalf("agent.New: %v", err)
+	}
+
+	resp, err := ag.Loop(context.Background(), []agent.Message{{
+		Role: agent.RoleUser,
+		Content: agent.Content{
+			agent.NewTextContent("What's the weather in Dublin?"),
+		},
+	}}, nil)
+	if err != nil {
+		t.Fatalf("Agent.Loop: %v", err)
+	}
+	if resp == nil {
+		t.Fatalf("expected final response")
+	}
+	if got := resp.Content.LossyText(); got != "Dublin is sunny." {
+		t.Fatalf("final response mismatch: got %q", got)
+	}
+	if client.calls != 2 {
+		t.Fatalf("expected exactly 2 LLM calls, got %d", client.calls)
+	}
+}
+
+func (m *loopClient) CreateMessages(ctx context.Context, req agent.MessagesRequest, onUpdate func(agent.MessagesResponse)) (agent.MessagesResponse, error) {
+	m.calls++
+	switch m.calls {
+	case 1:
+		if len(req.Messages) != 1 {
+			m.t.Fatalf("first call expected 1 message, got %d", len(req.Messages))
+		}
+		var output []responses.ResponseOutputItemUnion
+		if err := json.Unmarshal([]byte(`[
+			{
+				"id":"rs_loop_1",
+				"type":"reasoning",
+				"summary":[{"type":"summary_text","text":"Need weather lookup first."}],
+				"status":"completed"
+			},
+			{
+				"id":"fc_loop_1",
+				"type":"function_call",
+				"call_id":"call_weather_1",
+				"name":"get_weather",
+				"arguments":"{\"location\":\"Dublin\"}",
+				"status":"completed"
+			}
+		]`), &output); err != nil {
+			m.t.Fatalf("json.Unmarshal first output: %v", err)
+		}
+		return agent.MessagesResponse{
+			Content:    responseOutputToContent(output),
+			StopReason: "tool_use",
+		}, nil
+	case 2:
+		if len(req.Messages) < 3 {
+			m.t.Fatalf("second call expected at least user+assistant+tool messages, got %d", len(req.Messages))
+		}
+		raw, err := json.Marshal(convertToResponsesInput(req.Messages))
+		if err != nil {
+			m.t.Fatalf("json.Marshal replay input: %v", err)
+		}
+		var items []map[string]any
+		if err := json.Unmarshal(raw, &items); err != nil {
+			m.t.Fatalf("json.Unmarshal replay input: %v", err)
+		}
+		var sawReasoning, sawFunctionCallOutput bool
+		for _, it := range items {
+			typ, _ := it["type"].(string)
+			switch typ {
+			case "reasoning":
+				sawReasoning = true
+			case "function_call_output":
+				sawFunctionCallOutput = true
+			}
+		}
+		if !sawReasoning {
+			m.t.Fatalf("expected replay input to include reasoning item, got %s", string(raw))
+		}
+		if !sawFunctionCallOutput {
+			m.t.Fatalf("expected replay input to include function_call_output, got %s", string(raw))
+		}
+		return agent.MessagesResponse{
+			Content: agent.Content{
+				agent.NewTextContent("Dublin is sunny."),
+			},
+			StopReason: "end_turn",
+		}, nil
+	default:
+		m.t.Fatalf("unexpected LLM call %d", m.calls)
+		return agent.MessagesResponse{}, nil
 	}
 }
